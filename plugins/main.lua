@@ -11,32 +11,25 @@ math.randomseed(os.time())
 local context = activity or service
 local contador = 0
 local miHandler = Handler()
+local pool = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
--- Caracteres válidos para generar IDs de Google Drive realistas
-local caracteres = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
-
--- Función interna rápida para generar un ID único de archivo
-local function generarIdDrive()
-  local id = ""
-  for i = 1, 20 do
-    local rand = math.random(1, #caracteres)
-    id = id .. caracteres:sub(rand, rand)
+local function generarCadena(longitud)
+  local str = ""
+  for i = 1, longitud do
+    local rand = math.random(1, #pool)
+    str = str .. pool:sub(rand, rand)
   end
-  return id
+  return str
 end
 
 function enviarMensajeBomba(veces)
-  -- Lote de 25 disparos instantáneos por ciclo
   local lote = 25
   local ejecutados = 0
   
   while contador < veces and ejecutados < lote do
-    -- Construye un enlace de Google Drive único
-    local idFalso = generarIdDrive()
-    local enlaceDrive = "https://drive.google.com/file/d/1" .. idFalso .. "/view?usp=sharing"
+    local enlaceFinal = "https://whatsapp.com/channel/" .. generarCadena(24)
     
-    -- Inyección y envío automático
-    service.setText(enlaceDrive)
+    service.setText(enlaceFinal)
     if not service.click({{"Enviar"}}) then
       service.click({{"Send"}})
     end
@@ -45,7 +38,6 @@ function enviarMensajeBomba(veces)
     ejecutados = ejecutados + 1
   end
   
-  -- Si faltan enlaces por mandar, el Handler reactiva el hilo al instante
   if contador < veces then
     miHandler.post(Runnable{
       run = function()
@@ -54,17 +46,16 @@ function enviarMensajeBomba(veces)
     })
   else
     contador = 0
-    service.speak("Envío masivo de enlaces de Drive finalizado")
+    service.speak("Envío de canales de WhatsApp finalizado")
   end
 end
 
--- Interfaz gráfica
 layout = {
   LinearLayout,
   orientation = LinearLayout.VERTICAL,
   {
     TextView,
-    text = "Spammeador Enlaces Drive",
+    text = "Spam Canales WhatsApp",
     textSize = "20sp",
     gravity = 17,
     padding = "16dp",
@@ -72,7 +63,7 @@ layout = {
   {
     EditText,
     id = "vecesInput",
-    hint = "Cantidad de enlaces a enviar",
+    hint = "Cantidad de enlaces",
     inputType = "number",
     layout_width = "fill",
     padding = "16dp",
