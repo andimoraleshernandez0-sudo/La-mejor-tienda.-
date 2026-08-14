@@ -1,0 +1,74 @@
+name: Actualizar catálogo
+
+on:
+  push:
+    paths:
+      - '**.lua'
+
+jobs:
+  update-catalog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Generar catalog.json con metadatos
+        run: |
+          python3 << 'PYEOF'
+          import os
+          import json
+          import re
+
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          branch = "main"
+          plugins = []
+
+          for file in sorted(os.listdir(".")):
+              if not file.endswith(".lua"):
+                  continue
+
+              meta = {
+                  "id": file.replace(".lua", ""),
+                  "name": file.replace(".lua", "").replace("-", " ").replace("_", " ").title(),
+                  "version": "1.0.0",
+                  "author": "Desconocido",
+                  "description": "Sin descripción.",
+                  "file_name": file,
+                  "download_url": f"https://raw.githubusercontent.com/{repo}/{branch}/{file}"
+              }
+
+              try:
+                  with open(file, "r", encoding="utf-8") as f:
+                      for line in f:
+                          line = line.strip()
+                          if not line.startswith("--"):
+                              break
+                          m = re.match(r"--\s*@(\w+):\s*(.+)", line)
+                          if m:
+                              key, value = m.group(1), m.group(2).strip()
+                              if key == "name":
+                                  meta["name"] = value
+                              elif key == "version":
+                                  meta["version"] = value
+                              elif key == "author":
+                                  meta["author"] = value
+                              elif key == "description":
+                                  meta["description"] = value
+              except Exception as e:
+                  print(f"Error leyendo {file}: {e}")
+
+              plugins.append(meta)
+
+          with open("catalog.json", "w", encoding="utf-8") as f:
+              json.dump(plugins, f, ensure_ascii=False, indent=2)
+
+          print(f"Catálogo generado con {len(plugins)} plugins.")
+          PYEOF
+
+      - name: Commit catalog.json
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add catalog.json
+          git diff --cached --quiet || git commit -m "Catálogo actualizado automáticamente"
+          git push
