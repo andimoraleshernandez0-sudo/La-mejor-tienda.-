@@ -1,0 +1,2556 @@
+-- ============================================================
+--  VAQUERO DEL BOSQUE - Plugin para Jieshuo
+--  Versión 3.0 "Juego en línea" | Por Ángel
+--  Guardar este archivo como UTF-8.
+-- ============================================================
+require "import"
+import "android.widget.*"
+import "android.view.*"
+import "android.content.*"
+import "android.os.Environment"
+import "android.media.MediaPlayer"
+import "android.media.AudioManager"
+import "java.io.*"
+import "java.security.MessageDigest"
+import "cjson"
+import "com.androlua.*"
+import "android.os.Handler"
+import "android.os.Looper"
+import "java.lang.Thread"
+import "java.lang.Runnable"
+import "java.lang.System"
+import "java.net.URL"
+import "java.net.URLEncoder"
+
+math.randomseed(os.time())
+
+local ctx = service or activity
+local JString = luajava.bindClass("java.lang.String")
+
+-- ============================================================
+--  RUTAS Y AJUSTES
+-- ============================================================
+local storage  = Environment.getExternalStorageDirectory().getPath()
+local base     = storage .. "/Jieshuo/Plugins/VaqueroBosque"
+local snd_path = base .. "/sonidos"
+local users_f  = base .. "/usuarios.json"
+local config_f = base .. "/config.json"
+
+for _, dir in ipairs({ base, snd_path }) do
+  local f = File(dir)
+  if not f.exists() then f.mkdirs() end
+end
+
+local function registrar(msg)
+  pcall(function()
+    local f = io.open(base .. "/registro.txt", "a")
+    if f then
+      f:write(os.date("%d/%m/%Y %H:%M:%S") .. "  " .. tostring(msg) .. "\n")
+      f:close()
+    end
+  end)
+end
+
+local CODIGO_ADMIN_INICIAL = "ANGEL2025"
+local CURA_BOTIQUIN   = 50
+local COSTO_BOTIQUIN  = 8
+local COSTO_DINAMITA  = 6
+local COSTO_WHISKY    = 5
+local COSTO_REVIVIR   = 10
+local COSTO_CABALLO   = 30
+local COSTO_CASA      = 80
+local COSTO_RESET_HAB = 20
+local MAX_NIVEL_HAB   = 10
+local MAX_MEJORA      = 5
+local MAX_ARMADURA    = 10
+local ESPERA_PASEO    = 600 -- segundos entre cabalgatas
+
+-- ============================================================
+--  PERSISTENCIA JSON
+-- ============================================================
+local function leerArchivo(ruta)
+  local f = io.open(ruta, "r")
+  if not f then return nil end
+  local c = f:read("*a")
+  f:close()
+  return c
+end
+
+local function decodificar(ruta)
+  local c = leerArchivo(ruta)
+  if c and c ~= "" then
+    local ok, d = pcall(cjson.decode, c)
+    if ok and type(d) == "table" then return d end
+  end
+  return nil
+end
+
+local function leerJSON(ruta, def)
+  return decodificar(ruta) or decodificar(ruta .. ".bak") or def
+end
+
+local function escribirJSON(ruta, datos)
+  local ok, txt = pcall(cjson.encode, datos)
+  if not ok then return false end
+  local tmp = ruta .. ".tmp"
+  local f = io.open(tmp, "w")
+  if not f then return false end
+  f:write(txt)
+  f:close()
+  local actual = File(ruta)
+  if actual.exists() then
+    local bak = File(ruta .. ".bak")
+    if bak.exists() then bak.delete() end
+    actual.renameTo(bak)
+  end
+  return File(tmp).renameTo(File(ruta))
+end
+
+-- ============================================================
+--  SEGURIDAD Y CONFIG
+-- ============================================================
+local function sha256(txt)
+  local ok, res = pcall(function()
+    local md = MessageDigest.getInstance("SHA-256")
+    local bytes = md.digest(JString(txt).getBytes("UTF-8"))
+    local t = {}
+    for i = 0, bytes.length - 1 do
+      t[#t + 1] = string.format("%02x", (bytes[i] + 256) % 256)
+    end
+    return table.concat(t)
+  end)
+  if ok then return res end
+  return nil
+end
+
+local function nuevaSal() return string.format("%08x%08x", math.random(0, 0x7fffffff), os.time()) end
+local function hashPass(pw, sal) return sha256((sal or "") .. pw) or pw end
+local function trim(s) return (tostring(s):gsub("^%s+", ""):gsub("%s+$", "")) end
+local function ent(x) return math.floor(x + 0.5) end
+local function azar(a, b) return math.random(ent(a), ent(b)) end
+
+local config = leerJSON(config_f, {})
+local function guardarConfig() escribirJSON(config_f, config) end
+
+if config.musica == nil then config.musica = true end
+if config.narracion == nil then config.narracion = true end
+if not config.admin_hash then
+  config.admin_sal  = nuevaSal()
+  config.admin_hash = hashPass(CODIGO_ADMIN_INICIAL, config.admin_sal)
+end
+
+-- ============================================================
+--  SONIDOS: BÚSQUEDA Y VALIDACIÓN
+-- ============================================================
+local EXTENSIONES = { "mp3", "ogg", "wav" }
+
+local function tamano(ruta)
+  local f = File(ruta)
+  if f.exists() then return f.length() end
+  return 0
+end
+
+local function audioValido(ruta)
+  local f = io.open(ruta, "rb")
+  if not f then return false end
+  local h = f:read(4) or ""
+  f:close()
+  if h:sub(1, 3) == "ID3" or h == "OggS" or h == "RIFF" then return true end
+  local b1, b2 = h:byte(1, 2)
+  return b1 == 0xFF and b2 ~= nil and b2 >= 0xE0
+end
+
+local function rutaSonido(id)
+  for _, ext in ipairs(EXTENSIONES) do
+    local r = snd_path .. "/" .. id .. "." .. ext
+    if tamano(r) > 0 then
+      if audioValido(r) then return r end
+      pcall(function() File(r).delete() end)
+    end
+  end
+  return nil
+end
+
+-- ============================================================
+--  MOTOR DE AUDIO
+-- ============================================================
+local mp_bgm, mp_sfx, mp_sfx2
+local pista_actual = nil
+local function volumen() return config.volumen or 0.35 end
+
+local function liberar(mp)
+  if not mp then return end
+  pcall(function() mp.stop() end)
+  pcall(function() mp.release() end)
+end
+
+-- secundario = true usa un segundo canal, para que dos efectos suenen a la vez
+local function reproducirEfecto(id, secundario)
+  local ruta = rutaSonido(id)
+  if not ruta then return end
+  pcall(function()
+    if secundario then liberar(mp_sfx2) else liberar(mp_sfx) end
+    local mp = MediaPlayer()
+    mp.setAudioStreamType(AudioManager.STREAM_MUSIC)
+    mp.setDataSource(ruta)
+    mp.setVolume(1.0, 1.0)
+    mp.prepare()
+    mp.start()
+    if secundario then mp_sfx2 = mp else mp_sfx = mp end
+  end)
+end
+
+local function detenerMusica()
+  if mp_bgm then liberar(mp_bgm) mp_bgm = nil end
+  pista_actual = nil
+end
+
+local function cambiarMusica(id_pista)
+  if not config.musica then detenerMusica() return end
+  if pista_actual == id_pista and mp_bgm ~= nil then return end
+  detenerMusica()
+  local ruta = rutaSonido(id_pista)
+  if not ruta then return end
+  pcall(function()
+    mp_bgm = MediaPlayer()
+    mp_bgm.setAudioStreamType(AudioManager.STREAM_MUSIC)
+    mp_bgm.setDataSource(ruta)
+    mp_bgm.setLooping(true)
+    mp_bgm.setVolume(volumen(), volumen())
+    mp_bgm.prepare()
+    mp_bgm.start()
+    pista_actual = id_pista
+  end)
+end
+
+local function liberarAudio()
+  detenerMusica()
+  liberar(mp_sfx) mp_sfx = nil
+  liberar(mp_sfx2) mp_sfx2 = nil
+end
+
+-- ============================================================
+--  GENERADOR SINTÉTICO DE SONIDOS Y MELODÍAS
+-- ============================================================
+local function escribirWav(id, rate, dur, fn)
+  local floor, char = math.floor, string.char
+  local n = floor(rate * dur)
+  local partes = {}
+  for i = 0, n - 1 do
+    local v = fn(i / rate)
+    if v > 1 then v = 1 elseif v < -1 then v = -1 end
+    local s = floor(v * 30000)
+    if s < 0 then s = s + 65536 end
+    partes[#partes + 1] = char(s % 256, floor(s / 256))
+  end
+  local datos = table.concat(partes)
+  local function le32(x) return char(x % 256, floor(x / 256) % 256, floor(x / 65536) % 256, floor(x / 16777216) % 256) end
+  local function le16(x) return char(x % 256, floor(x / 256) % 256) end
+  local cab = "RIFF" .. le32(36 + #datos) .. "WAVEfmt " .. le32(16) .. le16(1) .. le16(1) .. le32(rate) .. le32(rate * 2) .. le16(2) .. le16(16) .. "data" .. le32(#datos)
+  local f = io.open(snd_path .. "/" .. id .. ".wav", "wb")
+  if not f then return false end
+  f:write(cab .. datos)
+  f:close()
+  return true
+end
+
+local PI, sin, exp = math.pi, math.sin, math.exp
+local function ruido() return math.random() * 2 - 1 end
+
+-- Melodía en bucle (notas con 0 = silencio) con percusión opcional
+local function melodia(notas, paso, vol, perc)
+  return function(t)
+    local k = math.floor(t / paso) % #notas + 1
+    local tt = t % paso
+    local f = notas[k]
+    local v = 0
+    if f > 0 then v = (sin(2 * PI * f * tt) + 0.35 * sin(4 * PI * f * tt)) * exp(-tt * 5) * vol end
+    if perc then v = v + ruido() * exp(-(t % perc) * 40) * 0.12 end
+    return v
+  end
+end
+
+-- Arpegio de una sola vez (fanfarrias)
+local function arpegio(notas, paso)
+  return function(t)
+    local k = math.min(#notas, math.floor(t / paso) + 1)
+    local tt = t - (k - 1) * paso
+    local f = notas[k]
+    return (sin(2 * PI * f * tt) + 0.4 * sin(4 * PI * f * tt)) * exp(-tt * 6) * 0.45
+  end
+end
+
+local SINTETICOS = {
+  lobby_music   = function() return 11025, 4.0,  melodia({ 220, 261.63, 329.63, 293.66, 261.63, 246.94, 220, 196 }, 0.5, 0.35) end,
+  combate_music = function() return 11025, 1.6,  melodia({ 146.83, 0, 146.83, 174.61, 146.83, 0, 130.81, 138.59 }, 0.2, 0.4, 0.2) end,
+  horda_music   = function() return 11025, 1.2,  melodia({ 110, 130.81, 110, 146.83, 110, 164.81, 110, 155.56 }, 0.15, 0.45, 0.15) end,
+  jefe_music    = function() return 11025, 1.76, melodia({ 98, 103.83, 98, 0, 87.31, 92.5, 87.31, 0 }, 0.22, 0.5, 0.44) end,
+  victoria      = function() return 22050, 0.92, arpegio({ 523.25, 659.25, 783.99, 1046.5 }, 0.14) end,
+  snd_nivel     = function() return 22050, 0.9,  arpegio({ 392, 523.25, 659.25, 783.99, 1046.5 }, 0.12) end,
+  snd_logro     = function() return 22050, 0.9,  arpegio({ 523.25, 659.25, 783.99, 1046.5, 783.99, 1046.5, 1318.5 }, 0.1) end,
+  snd_derrota   = function() return 22050, 1.2,  arpegio({ 392, 349.23, 311.13, 261.63 }, 0.28) end,
+  snd_revolver  = function() return 22050, 0.25, function(t) return ruido() * exp(-t * 20) * 0.9 + sin(2 * PI * 100 * t) * exp(-t * 35) * 0.5 end end,
+  snd_escopeta  = function() return 22050, 0.40, function(t) return ruido() * exp(-t * 10) * 0.95 + sin(2 * PI * 55 * t) * exp(-t * 20) * 0.7 end end,
+  snd_rifle     = function() return 22050, 0.35, function(t) return ruido() * exp(-t * 15) * 0.85 + sin(2 * PI * 150 * t) * exp(-t * 40) * 0.4 end end,
+  snd_elefantes = function() return 22050, 0.50, function(t) return ruido() * exp(-t * 7) * 1.0 + sin(2 * PI * 40 * t) * exp(-t * 15) * 0.8 end end,
+  snd_dorado    = function() return 22050, 0.30, function(t) return (ruido() + sin(2 * PI * 300 * t)) * exp(-t * 25) * 0.7 end end,
+  snd_gatling   = function() return 22050, 0.60, function(t) return ruido() * exp(-(t % 0.1) * 30) * 0.8 end end,
+  snd_critico   = function() return 22050, 0.35, function(t) return (sin(2 * PI * 880 * t) + sin(2 * PI * 1320 * t) * 0.6) * exp(-t * 10) * 0.5 end end,
+  snd_moneda    = function() return 22050, 0.30, function(t) local f = (t < 0.08) and 988 or 1319 return sin(2 * PI * f * t) * exp(-t * 9) * 0.5 end end,
+  snd_golpe     = function() return 22050, 0.22, function(t) return ruido() * exp(-t * 18) * 0.6 + sin(2 * PI * 60 * t) * exp(-t * 25) * 0.8 end end,
+  snd_esquiva   = function() return 22050, 0.25, function(t) return ruido() * 0.4 * sin(PI * t / 0.25) end end,
+  snd_dinamita  = function() return 22050, 0.90, function(t) return ruido() * exp(-t * 4) * 0.9 + sin(2 * PI * 38 * t) * exp(-t * 5) * 0.8 end end,
+  snd_curar     = function() return 22050, 0.45, function(t) return sin(2 * PI * (400 * t + 500 * t * t)) * exp(-t * 3) * 0.5 end end,
+}
+
+local function generarSinteticos()
+  -- Al cambiar de versión se regeneran los sonidos sintéticos (nunca tus mp3/ogg propios)
+  if config.sonidos_v ~= 2 then
+    for id, _ in pairs(SINTETICOS) do
+      pcall(function() File(snd_path .. "/" .. id .. ".wav").delete() end)
+    end
+    config.sonidos_v = 2
+    guardarConfig()
+  end
+  for id, fab in pairs(SINTETICOS) do
+    if not rutaSonido(id) then
+      pcall(function() local r, d, f = fab() escribirWav(id, r, d, f) end)
+    end
+  end
+end
+
+-- ============================================================
+--  DATOS DEL JUEGO
+-- ============================================================
+local ARMAS = {
+  { nombre = "Revólver", dano = 20, disparos = 1, costo = 0, crit = 5, snd = "snd_revolver",
+    rasgo = "Fiable: +5% de probabilidad de crítico." },
+  { nombre = "Escopeta Recortada", dano = 40, disparos = 1, costo = 25, crit = 0, aturdir = 15, snd = "snd_escopeta",
+    rasgo = "15% de aturdir al enemigo y hacerle perder el turno." },
+  { nombre = "Rifle de Precisión", dano = 60, disparos = 1, costo = 45, crit = 20, snd = "snd_rifle",
+    rasgo = "+20% de probabilidad de crítico." },
+  { nombre = "Rifle de Elefantes", dano = 90, disparos = 1, costo = 75, crit = 0, perfora = true, jefe = 0.3, snd = "snd_elefantes",
+    rasgo = "Nunca falla y hace 30% más de daño a jefes." },
+  { nombre = "Doble Revólver Dorado", dano = 65, disparos = 2, costo = 120, crit = 8, snd = "snd_dorado",
+    rasgo = "Dispara dos veces por turno." },
+  { nombre = "Gatling de Oro Pura", dano = 50, disparos = 4, costo = 200, crit = 0, snd = "snd_gatling",
+    rasgo = "Ráfaga de cuatro disparos por turno." },
+  { nombre = "Winchester Maldita", dano = 120, disparos = 2, costo = 350, crit = 10, req = 15, snd = "snd_rifle",
+    rasgo = "Dos disparos por turno y +10% de crítico." },
+  { nombre = "Cañón de Mano", dano = 320, disparos = 1, costo = 600, crit = 0, perfora = true, jefe = 0.4, req = 25, snd = "snd_elefantes",
+    rasgo = "Nunca falla y hace 40% más de daño a jefes." },
+  { nombre = "Ametralladora del Oeste", dano = 90, disparos = 5, costo = 1000, crit = 0, aturdir = 10, req = 40, snd = "snd_gatling",
+    rasgo = "Cinco disparos por turno y 10% de aturdir." },
+  { nombre = "Fusil del Trueno", dano = 140, disparos = 4, costo = 1800, crit = 15, req = 55, snd = "snd_rifle",
+    rasgo = "Cuatro disparos por turno y +15% de crítico." },
+  { nombre = "Pistola Fantasma", dano = 220, disparos = 4, costo = 3000, crit = 15, perfora = true, req = 75, snd = "snd_dorado",
+    rasgo = "Cuatro disparos que atraviesan toda esquiva." },
+  { nombre = "Arma del Rey Fantasma", dano = 350, disparos = 4, costo = 6000, crit = 20, perfora = true, jefe = 0.3, req = 90, snd = "snd_gatling",
+    rasgo = "El arma definitiva: cuatro disparos, +20% de crítico y +30% contra jefes." },
+}
+local ARMA_POR_NOMBRE = {}
+for _, a in ipairs(ARMAS) do ARMA_POR_NOMBRE[a.nombre] = a end
+
+local TIPOS = {
+  forajido      = { nombre = "Forajido",         hp = 1.0, atk = 1.0,  esq = 0 },
+  pistolero     = { nombre = "Pistolero Veloz",  hp = 0.8, atk = 1.15, esq = 15 },
+  bruto         = { nombre = "Bruto del Pantano", hp = 1.7, atk = 0.85, esq = 0 },
+  francotirador = { nombre = "Francotirador",    hp = 0.7, atk = 1.4,  esq = 10 },
+  dinamitero    = { nombre = "Dinamitero Loco",  hp = 0.9, atk = 1.0,  esq = 0 },
+  mercenario    = { nombre = "Mercenario",       hp = 1.3, atk = 1.1,  esq = 10 },
+  cazasombras   = { nombre = "Cazador de Sombras", hp = 1.0, atk = 1.3, esq = 20 },
+  titan         = { nombre = "Titán de Hierro",  hp = 2.2, atk = 1.0,  esq = 0 },
+  espectro      = { nombre = "Espectro del Bosque", hp = 1.1, atk = 1.4, esq = 25 },
+}
+local APODOS = { "Jack el Tuerto", "Black Bill", "Dos Dedos", "Mala Sombra", "Tex Cicatriz",
+  "Rufián Rojo", "Coyote Sam", "Jesse Humo", "Barba Sucia", "Pete Cuchillo", "Víbora Kid", "Lobo Gris" }
+
+local MAX_NIVELES = 100
+local REGIONES = {
+  { "Bosque de los Pinos", "Senderos estrechos entre pinos altos donde el viento susurra." },
+  { "Cañón del Buitre", "Paredes de roca roja, buitres en el cielo y francotiradores en las alturas." },
+  { "Pantano Maldito", "Niebla espesa y barro hasta las rodillas. Algo se mueve bajo el agua." },
+  { "Montañas Heladas", "Ventiscas, cuevas heladas y bandidos abrigados hasta los dientes." },
+  { "Desierto de Ceniza", "Dunas grises bajo un sol implacable. Aquí nadie sobrevive solo." },
+  { "Pueblo Fantasma", "Puertas que golpean solas y ventanas con ojos que te siguen." },
+  { "Ferrocarril Negro", "Trenes blindados cargados de oro y custodiados por pistoleros de élite." },
+  { "Fortalezas del Barón", "Muros de piedra, cañones y guardias en cada torre." },
+  { "Valle de las Tormentas", "Rayos que caen sobre lápidas torcidas. Los duelos nunca terminan." },
+  { "Trono del Rey Fantasma", "El corazón del bosque. El final del camino está cerca." },
+}
+local LUGARES = { "Entrada", "Sendero", "Claro", "Cueva", "Puente", "Ruinas", "Cañada", "Atalaya", "Guarida", "Corazón" }
+local function zonaDe(n)
+  local r = REGIONES[math.floor((n - 1) / 10) + 1]
+  return { r[1] .. ": " .. LUGARES[(n - 1) % 10 + 1], r[2] .. " (Nivel " .. n .. ")" }
+end
+local JEFES_LISTA = {
+  "El Coyote Negro", "El Barón Cuervo", "El Rey Fantasma del Bosque", "La Viuda Escarlata", "Machete Montoya",
+  "El Predicador Maldito", "Doña Pólvora", "El Jinete sin Cabeza", "Colmillo Blanco", "El Gran Bisonte de Hierro",
+  "La Reina del Pantano", "Sombra de Plomo", "El Sheriff Corrupto", "Mano de Fuego", "El Ladrón de Almas",
+  "Capitán Tormenta", "El Verdugo Eterno", "La Dama de las Cenizas", "El Gran Fantasma", "El Rey Fantasma Eterno",
+}
+local function jefeDe(n)
+  if n % 5 == 0 then return JEFES_LISTA[math.floor(n / 5)] end
+  return nil
+end
+-- vida y ataque base de los enemigos según el nivel de campaña (crece más suave después del 15)
+local function escala(n)
+  if n <= 15 then return 40 + n * 16, 7 + n * 2.4 end
+  local f = n - 15
+  return (40 + 15 * 16) * (1 + f * 0.045), (7 + 15 * 2.4) * (1 + f * 0.025)
+end
+
+local JEFES_HORDA = { "El Carnicero de Pino Negro", "Madame Cuervo", "Dos Caras Rojo", "El Verdugo del Valle", "Generalísimo Polvareda" }
+
+local HABS = {
+  { id = "punteria",    nombre = "Puntería",    desc = "+4% de probabilidad de crítico por nivel" },
+  { id = "reflejos",    nombre = "Reflejos",    desc = "+3% de esquiva y +2% de huida por nivel" },
+  { id = "resistencia", nombre = "Resistencia", desc = "+15 de vida máxima por nivel" },
+  { id = "fortuna",     nombre = "Fortuna",     desc = "+6% de diamantes en recompensas por nivel" },
+}
+
+local RANGOS = { "Novato", "Aprendiz de Pistolero", "Pistolero", "Cazarrecompensas", "Alguacil", "Leyenda del Oeste", "Fantasma del Bosque" }
+local function nombreRango(r) return RANGOS[math.min(#RANGOS, math.floor((r - 1) / 3) + 1)] end
+local function xpNecesaria(r) return 40 + r * 35 end
+
+-- ============================================================
+--  PARTIDA Y DATOS
+-- ============================================================
+local function cargarUsuarios() return leerJSON(users_f, {}) end
+local function guardarUsuarios(db) return escribirJSON(users_f, db) end
+
+local session = { usuario = nil, nombre = nil, partida = nil }
+
+local function partidaNueva()
+  return {
+    vida = 100, vida_max = 100, diamantes = 60,
+    nivel_actual = 1, campana_completa = false,
+    inventario_armas = { { nombre = "Revólver", dano = 20 } },
+    arma_equipada_idx = 1,
+    caballo = false, casa = false, banco = 0, banco_t = 0,
+    botiquines = 3, dinamitas = 2, whisky = 1, armadura = 0,
+    victorias = 0, muertes = 0,
+    rango = 1, xp = 0, puntos_hab = 0,
+    hab = { punteria = 0, reflejos = 0, resistencia = 0, fortuna = 0 },
+    mejoras = {}, logros = {},
+    stats = { kills = 0, criticos = 0, jefes = 0, dano_total = 0, diamantes_totales = 0, mejor_oleada = 0,
+      dinamitas_usadas = 0, apuestas_ganadas = 0, cazas = 0, torre_max = 0, duelos_ganados = 0 },
+    ultima_recompensa = "", racha = 0, ultimo_paseo = 0,
+    mina = { nivel = 0, t = 0 }, cazado = "", ruleta = "",
+  }
+end
+
+local function fusionar(pt, def)
+  for k, v in pairs(def) do
+    if pt[k] == nil then
+      pt[k] = v
+    elseif type(v) == "table" and type(pt[k]) == "table" and k ~= "inventario_armas" then
+      fusionar(pt[k], v)
+    end
+  end
+end
+
+local function enteros(t)
+  for k, v in pairs(t) do
+    if type(v) == "number" then t[k] = math.floor(v)
+    elseif type(v) == "table" then enteros(v) end
+  end
+end
+
+local function recalcularVida(pt)
+  pt.vida_max = 100 + (pt.rango - 1) * 8 + pt.hab.resistencia * 15
+end
+
+local function normalizarPartida(pt)
+  enteros(pt)
+  fusionar(pt, partidaNueva())
+  if #pt.inventario_armas == 0 then
+    pt.inventario_armas = { { nombre = "Revólver", dano = 20 } }
+  end
+  if pt.arma_equipada_idx < 1 or pt.arma_equipada_idx > #pt.inventario_armas then pt.arma_equipada_idx = 1 end
+  for _, inv in ipairs(pt.inventario_armas) do
+    local a = ARMA_POR_NOMBRE[inv.nombre]
+    if a then inv.dano = a.dano inv.disparos = a.disparos or 1 inv.crit = a.crit or 0 end
+  end
+  recalcularVida(pt)
+  pt.vida = math.max(0, math.min(pt.vida, pt.vida_max))
+  if pt.vida <= 0 then pt.vida = math.max(30, ent(pt.vida_max * 0.3)) end
+  pt.nivel_actual = math.max(1, math.min(100, pt.nivel_actual))
+  return pt
+end
+
+local function p() return session.partida end
+local function guardarPartida()
+  if not session.usuario or not session.partida then return end
+  local db = cargarUsuarios()
+  if db[session.usuario] then
+    db[session.usuario].partida = session.partida
+    guardarUsuarios(db)
+  end
+end
+
+local function recordarSesion(u) config.recordar = u guardarConfig() end
+
+local function datosArma(pt, inv)
+  local b = ARMA_POR_NOMBRE[inv.nombre] or ARMAS[1]
+  local lvl = pt.mejoras[b.nombre] or 0
+  return {
+    nombre = b.nombre, dano = ent(b.dano * (1 + 0.15 * lvl)), disparos = b.disparos or 1,
+    crit = b.crit or 0, aturdir = b.aturdir or 0, perfora = b.perfora, jefe = b.jefe or 0,
+    nivel = lvl, rasgo = b.rasgo, snd = b.snd,
+  }
+end
+
+local function armaActual(pt)
+  local inv = pt.inventario_armas[pt.arma_equipada_idx] or pt.inventario_armas[1]
+  return datosArma(pt, inv)
+end
+
+local function descArma(a)
+  local s
+  if a.disparos > 1 then s = a.disparos .. " disparos de " .. a.dano else s = "daño " .. a.dano end
+  if a.nivel > 0 then s = s .. ", mejora " .. a.nivel end
+  return s
+end
+
+local function tieneArma(pt, nombre)
+  for _, inv in ipairs(pt.inventario_armas) do
+    if inv.nombre == nombre then return true end
+  end
+  return false
+end
+
+-- ============================================================
+--  ECONOMÍA, EXPERIENCIA Y LOGROS
+-- ============================================================
+local function sumarDiamantes(pt, d)
+  pt.diamantes = pt.diamantes + d
+  pt.stats.diamantes_totales = pt.stats.diamantes_totales + d
+end
+
+local function ganarDiamantes(pt, d)
+  local t = ent(d * (1 + 0.06 * pt.hab.fortuna))
+  sumarDiamantes(pt, t)
+  return t
+end
+
+local function curaBot(pt) return math.max(CURA_BOTIQUIN, ent(pt.vida_max * 0.35)) end
+
+local function dar_xp(pt, cant)
+  pt.xp = pt.xp + cant
+  local msg = ""
+  while pt.xp >= xpNecesaria(pt.rango) do
+    pt.xp = pt.xp - xpNecesaria(pt.rango)
+    pt.rango = pt.rango + 1
+    pt.puntos_hab = pt.puntos_hab + 1
+    recalcularVida(pt)
+    pt.vida = pt.vida_max
+    msg = msg .. "\n⭐ ¡Subes a rango " .. pt.rango .. ": " .. nombreRango(pt.rango) .. "! +1 punto de habilidad y vida restaurada."
+    reproducirEfecto("snd_nivel", true)
+  end
+  return msg
+end
+
+local LOGROS = {
+  { id = "primera_sangre", n = "Primera Sangre", d = "Derrota a tu primer enemigo", p = 5, f = function(pt) return pt.stats.kills >= 1 end },
+  { id = "cazador", n = "Cazador", d = "Derrota a 25 enemigos", p = 15, f = function(pt) return pt.stats.kills >= 25 end },
+  { id = "exterminador", n = "Exterminador", d = "Derrota a 100 enemigos", p = 50, f = function(pt) return pt.stats.kills >= 100 end },
+  { id = "certero", n = "Certero", d = "Consigue 10 disparos críticos", p = 10, f = function(pt) return pt.stats.criticos >= 10 end },
+  { id = "ojo_aguila", n = "Ojo de Águila", d = "Consigue 50 disparos críticos", p = 40, f = function(pt) return pt.stats.criticos >= 50 end },
+  { id = "matajefes", n = "Matajefes", d = "Derrota a un jefe", p = 25, f = function(pt) return pt.stats.jefes >= 1 end },
+  { id = "rey_fantasma", n = "Rey de los Fantasmas", d = "Completa los 100 niveles de la campaña", p = 150, f = function(pt) return pt.campana_completa end },
+  { id = "superviviente", n = "Superviviente", d = "Llega a la oleada 5 en Supervivencia", p = 20, f = function(pt) return pt.stats.mejor_oleada >= 5 end },
+  { id = "imparable", n = "Imparable", d = "Llega a la oleada 15 en Supervivencia", p = 80, f = function(pt) return pt.stats.mejor_oleada >= 15 end },
+  { id = "coleccionista", n = "Coleccionista", d = "Consigue todas las armas", p = 60, f = function(pt) return #pt.inventario_armas >= #ARMAS end },
+  { id = "terrateniente", n = "Terrateniente", d = "Ten caballo y cabaña", p = 20, f = function(pt) return pt.caballo and pt.casa end },
+  { id = "ahorrador", n = "Ahorrador", d = "Guarda 200 diamantes en el banco", p = 30, f = function(pt) return pt.banco >= 200 end },
+  { id = "veterano", n = "Veterano", d = "Alcanza el rango 10", p = 50, f = function(pt) return pt.rango >= 10 end },
+  { id = "magnate", n = "Magnate", d = "Reúne 1000 diamantes en total", p = 40, f = function(pt) return pt.stats.diamantes_totales >= 1000 end },
+  { id = "blindado", n = "Blindado", d = "Chaleco al nivel máximo", p = 30, f = function(pt) return pt.armadura >= MAX_ARMADURA end },
+  { id = "explorador", n = "Explorador", d = "Supera el nivel 10", p = 20, f = function(pt) return pt.nivel_actual >= 11 end },
+  { id = "veterano_guerra", n = "Veterano de Guerra", d = "Supera el nivel 25", p = 40, f = function(pt) return pt.nivel_actual >= 26 end },
+  { id = "leyenda_campana", n = "Leyenda de la Campaña", d = "Supera el nivel 50", p = 100, f = function(pt) return pt.nivel_actual >= 51 end },
+  { id = "casi_inmortal", n = "Casi Inmortal", d = "Supera el nivel 75", p = 200, f = function(pt) return pt.nivel_actual >= 76 end },
+  { id = "cazamasas", n = "Cazamasas", d = "Derrota a 500 enemigos", p = 100, f = function(pt) return pt.stats.kills >= 500 end },
+  { id = "plaga_oeste", n = "Plaga del Oeste", d = "Derrota a 2000 enemigos", p = 300, f = function(pt) return pt.stats.kills >= 2000 end },
+  { id = "francotirador", n = "Francotirador Letal", d = "Consigue 200 críticos", p = 120, f = function(pt) return pt.stats.criticos >= 200 end },
+  { id = "cirujano", n = "Cirujano de Plomo", d = "Consigue 1000 críticos", p = 300, f = function(pt) return pt.stats.criticos >= 1000 end },
+  { id = "destructor_jefes", n = "Destructor de Jefes", d = "Derrota a 10 jefes", p = 100, f = function(pt) return pt.stats.jefes >= 10 end },
+  { id = "cazajefes", n = "Cazajefes Supremo", d = "Derrota a 50 jefes", p = 400, f = function(pt) return pt.stats.jefes >= 50 end },
+  { id = "piromano", n = "Pirómano", d = "Lanza 25 dinamitas", p = 30, f = function(pt) return pt.stats.dinamitas_usadas >= 25 end },
+  { id = "demoledor", n = "Demoledor", d = "Lanza 100 dinamitas", p = 100, f = function(pt) return pt.stats.dinamitas_usadas >= 100 end },
+  { id = "jugador_dados", n = "Jugador de Dados", d = "Gana 5 apuestas en la cantina", p = 20, f = function(pt) return pt.stats.apuestas_ganadas >= 5 end },
+  { id = "suerte_campeon", n = "Suerte de Campeón", d = "Gana 25 apuestas en la cantina", p = 80, f = function(pt) return pt.stats.apuestas_ganadas >= 25 end },
+  { id = "cazarrecompensas", n = "Cazarrecompensas", d = "Captura a un buscado", p = 30, f = function(pt) return pt.stats.cazas >= 1 end },
+  { id = "cazarrecompensas_estrella", n = "Cazarrecompensas Estrella", d = "Captura a 10 buscados", p = 150, f = function(pt) return pt.stats.cazas >= 10 end },
+  { id = "escalador", n = "Escalador", d = "Llega al piso 5 de la Torre de los Jefes", p = 40, f = function(pt) return pt.stats.torre_max >= 5 end },
+  { id = "rey_torre", n = "Rey de la Torre", d = "Llega al piso 15 de la Torre", p = 150, f = function(pt) return pt.stats.torre_max >= 15 end },
+  { id = "maestro_torre", n = "Maestro de la Torre", d = "Llega al piso 30 de la Torre", p = 400, f = function(pt) return pt.stats.torre_max >= 30 end },
+  { id = "minero", n = "Minero", d = "Compra la mina de oro", p = 20, f = function(pt) return pt.mina.nivel >= 1 end },
+  { id = "baron_oro", n = "Barón del Oro", d = "Mejora la mina al nivel 10", p = 150, f = function(pt) return pt.mina.nivel >= 10 end },
+  { id = "fiebre_oro", n = "Fiebre del Oro", d = "Mejora la mina al nivel 25", p = 500, f = function(pt) return pt.mina.nivel >= 25 end },
+  { id = "primer_duelo", n = "Primer Duelo Ganado", d = "Gana un duelo en línea", p = 30, f = function(pt) return pt.stats.duelos_ganados >= 1 end },
+  { id = "duelista", n = "Duelista", d = "Gana 10 duelos en línea", p = 120, f = function(pt) return pt.stats.duelos_ganados >= 10 end },
+  { id = "leyenda_duelos", n = "Leyenda de los Duelos", d = "Gana 50 duelos en línea", p = 400, f = function(pt) return pt.stats.duelos_ganados >= 50 end },
+  { id = "constante", n = "Constante", d = "Reclama la recompensa diaria 7 días seguidos", p = 50, f = function(pt) return pt.racha >= 7 end },
+  { id = "fiel_oeste", n = "Fiel al Oeste", d = "Reclama la recompensa diaria 30 días seguidos", p = 300, f = function(pt) return pt.racha >= 30 end },
+  { id = "alguacil_mayor", n = "Alguacil Mayor", d = "Alcanza el rango 25", p = 150, f = function(pt) return pt.rango >= 25 end },
+  { id = "mito_viviente", n = "Mito Viviente", d = "Alcanza el rango 50", p = 500, f = function(pt) return pt.rango >= 50 end },
+  { id = "superviviente_epico", n = "Superviviente Épico", d = "Llega a la oleada 30 en Supervivencia", p = 200, f = function(pt) return pt.stats.mejor_oleada >= 30 end },
+  { id = "fortuna_max", n = "Fortuna Máxima", d = "Fortuna al nivel 10", p = 100, f = function(pt) return pt.hab.fortuna >= 10 end },
+  { id = "maestro_habilidades", n = "Maestro de Habilidades", d = "Las cuatro habilidades al nivel 10", p = 300, f = function(pt) return pt.hab.punteria >= 10 and pt.hab.reflejos >= 10 and pt.hab.resistencia >= 10 and pt.hab.fortuna >= 10 end },
+  { id = "millonario", n = "Millonario", d = "Reúne 10000 diamantes en total", p = 100, f = function(pt) return pt.stats.diamantes_totales >= 10000 end },
+  { id = "multimillonario", n = "Multimillonario", d = "Reúne 100000 diamantes en total", p = 500, f = function(pt) return pt.stats.diamantes_totales >= 100000 end },
+  { id = "arma_perfecta", n = "Arma Perfecta", d = "Mejora un arma al nivel máximo", p = 60, f = function(pt) for _, v in pairs(pt.mejoras) do if v >= MAX_MEJORA then return true end end return false end },
+  { id = "pistolero_fantasma", n = "Pistolero Fantasma", d = "Consigue el Arma del Rey Fantasma", p = 200, f = function(pt) for _, inv in ipairs(pt.inventario_armas) do if inv.nombre == "Arma del Rey Fantasma" then return true end end return false end },
+}
+
+local function revisarLogros(pt)
+  local txt = ""
+  for _, l in ipairs(LOGROS) do
+    if not pt.logros[l.id] and l.f(pt) then
+      pt.logros[l.id] = true
+      sumarDiamantes(pt, l.p)
+      txt = txt .. "\n🏆 Logro desbloqueado: " .. l.n .. " (+" .. l.p .. " diamantes)"
+      reproducirEfecto("snd_logro", true)
+    end
+  end
+  return txt
+end
+
+-- ============================================================
+--  INTERFAZ
+-- ============================================================
+local dlg_activo = nil
+local function hablar(txt) pcall(function() service.asyncSpeak(txt) end) end
+local function narrar(txt) if config.narracion ~= false then hablar(txt) end end
+local function cerrar() if dlg_activo then pcall(function() dlg_activo.dismiss() end) dlg_activo = nil end end
+local function salirDelJuego() guardarPartida() liberarAudio() cerrar() end
+
+local function hud()
+  local pt = p()
+  local a = armaActual(pt)
+  return string.format(
+    "%s | Rango %d: %s (XP %d/%d)\nVida %d/%d | Diamantes %d\nBotiquines %d | Dinamitas %d | Whisky %d | Chaleco %d\nArma: %s (%s)",
+    session.nombre or "?", pt.rango, nombreRango(pt.rango), pt.xp, xpNecesaria(pt.rango),
+    pt.vida, pt.vida_max, pt.diamantes, pt.botiquines, pt.dinamitas, pt.whisky, pt.armadura,
+    a.nombre, descArma(a))
+end
+
+local function mostrarLayout(titulo, mensaje, bots)
+  local interior = { LinearLayout, orientation = "vertical", layout_width = "fill", padding = "14dp" }
+  if mensaje and mensaje ~= "" then
+    table.insert(interior, { TextView, text = mensaje, layout_width = "fill", layout_marginBottom = "10dp", textSize = "15sp" })
+  end
+  for _, b in ipairs(bots) do
+    table.insert(interior, { Button, text = b[1], layout_width = "fill", layout_marginBottom = "6dp", onClick = function() b[2]() end })
+  end
+  local raiz = { ScrollView, layout_width = "fill", interior }
+
+  cerrar()
+  local d = LuaDialog(ctx)
+  d.setTitle(titulo)
+  d.setView(loadlayout(raiz, {}))
+  pcall(function() d.setOnCancelListener { onCancel = function() salirDelJuego() end } end)
+  d.show()
+  dlg_activo = d
+end
+
+-- Estado de partida en curso
+local combate = nil
+local viaje = nil
+local horda = nil
+
+-- Declaraciones adelantadas
+local pantallaInicio, pantallaLogin, pantallaRegistro, mostrarMenu, mostrarNovedades
+local seleccionarNivel, iniciarNivel, avanzarEtapa, pausaViaje, comenzarCombateNivel
+local mostrarCombate, botonesCombate, finTurno, muerte, victoriaCombate
+local menuModoHorda, siguienteOleada, retirarHorda
+local mostrarArmeria, mostrarMejoras, mostrarAlmacen, mostrarEstablo, mostrarCasa, mostrarBanco
+local mostrarHabilidades, mostrarLogros, mostrarFama, mostrarEstadisticas, mostrarAjustes
+local recompensaDiaria, elegirArma, cambiarPassword
+local ON, MD = {}, {}
+
+-- ============================================================
+--  ENEMIGOS
+-- ============================================================
+local function crearEnemigo(tipo, hp, atk)
+  local t = TIPOS[tipo]
+  local e = {
+    tipo = tipo, nombre = t.nombre .. " " .. APODOS[math.random(#APODOS)],
+    vida = ent(hp * t.hp), ataque = atk * t.atk, esq = t.esq,
+  }
+  e.vida_max = e.vida
+  return e
+end
+
+local function crearJefe(nombre, hp, atk)
+  return { tipo = "jefe", nombre = nombre, vida = ent(hp), vida_max = ent(hp), ataque = atk, esq = 8, jefe = true }
+end
+
+local function tipoAleatorio(n)
+  local lista = { "forajido", "pistolero" }
+  if n >= 3 then table.insert(lista, "bruto") end
+  if n >= 5 then table.insert(lista, "francotirador") end
+  if n >= 7 then table.insert(lista, "dinamitero") end
+  if n >= 20 then table.insert(lista, "mercenario") end
+  if n >= 40 then table.insert(lista, "cazasombras") end
+  if n >= 60 then table.insert(lista, "titan") end
+  if n >= 80 then table.insert(lista, "espectro") end
+  return lista[math.random(#lista)]
+end
+
+-- ============================================================
+--  MOTOR DE COMBATE
+-- ============================================================
+local function esquivaJugador(pt)
+  return math.min(60, 5 + pt.hab.reflejos * 3 + (pt.caballo and 7 or 0))
+end
+
+local function registrarBaja(pt, en)
+  pt.stats.kills = pt.stats.kills + 1
+  if en.jefe then pt.stats.jefes = pt.stats.jefes + 1 end
+end
+
+local function ataqueEnemigo(pt, c, en, factor)
+  if en.aturdido then
+    en.aturdido = false
+    return 0, en.nombre .. " está aturdido y pierde su turno."
+  end
+  local dano = en.ataque * factor * (0.85 + math.random() * 0.3)
+  local esp = nil
+  local r = math.random(100)
+  if en.tipo == "bruto" and r <= 20 then dano = dano * 1.6 esp = "¡golpe aplastante!"
+  elseif en.tipo == "dinamitero" and r <= 25 then dano = dano * 1.8 esp = "¡lanza dinamita!"
+  elseif en.tipo == "francotirador" and r <= 25 then dano = dano * 1.7 esp = "¡disparo certero!"
+  elseif en.tipo == "jefe" and r <= 25 then dano = dano * 1.6 esp = "¡ataque devastador!"
+  elseif en.tipo == "cazasombras" and r <= 20 then dano = dano * 1.6 esp = "¡ataque a traición!"
+  elseif en.tipo == "titan" and r <= 15 then dano = dano * 1.7 esp = "¡pisotón demoledor!"
+  elseif en.tipo == "espectro" and r <= 25 then dano = dano * 1.5 esp = "¡toque helado!" end
+  if en.furia then dano = dano * 1.4 end
+  if math.random(100) <= esquivaJugador(pt) then
+    reproducirEfecto("snd_esquiva", true)
+    return 0, "Esquivas el ataque de " .. en.nombre .. "."
+  end
+  if c.cubierto then dano = dano * 0.4 end
+  dano = math.max(1, ent(dano * (1 - 0.02 * pt.armadura)) - pt.armadura * 3)
+  return dano, en.nombre .. " te ataca" .. (esp and (": " .. esp) or ".")
+end
+
+local function disparoJugador(pt, c, en, arma, apuntado)
+  local esq = en.esq or 0
+  if apuntado or arma.perfora then esq = 0 end
+  if math.random(100) <= esq then return 0, false, true end
+  local d = arma.dano * (0.9 + math.random() * 0.2)
+  if c.whisky > 0 then d = d * 1.3 end
+  if en.jefe and arma.jefe > 0 then d = d * (1 + arma.jefe) end
+  local prob = math.min(85, 8 + pt.hab.punteria * 4 + arma.crit)
+  local crit = apuntado or (math.random(100) <= prob)
+  if crit then d = d * 2 end
+  return math.max(1, ent(d)), crit, false
+end
+
+function mostrarCombate(msg)
+  local pt, c = p(), combate
+  if not c then mostrarMenu() return end
+  local lineas = {}
+  for i, e in ipairs(c.enemigos) do
+    table.insert(lineas, (i == 1 and "▶ " or "• ") .. e.nombre .. ": vida " .. e.vida .. "/" .. e.vida_max .. (e.furia and " [EN FURIA]" or ""))
+  end
+  local estados = ""
+  if c.whisky > 0 then estados = estados .. "\n🥃 Whisky activo: " .. c.whisky .. " turno(s)." end
+  if c.apuntando then estados = estados .. "\n🎯 Apuntando: el próximo disparo será crítico." end
+  mostrarLayout(c.titulo, (msg or "") .. "\n\nEnemigos:\n" .. table.concat(lineas, "\n") .. estados .. "\n\n" .. hud(), botonesCombate())
+  narrar((msg or "") .. " Tu vida: " .. pt.vida .. ". Enemigo al frente: " .. c.enemigos[1].nombre .. ", vida " .. c.enemigos[1].vida .. ".")
+end
+
+function finTurno(partes)
+  local pt, c = p(), combate
+  if not c then mostrarMenu() return end
+  if #c.enemigos == 0 then victoriaCombate(partes) return end
+
+  local frente = c.enemigos[1]
+  if frente.jefe and not frente.furia and frente.vida <= frente.vida_max * 0.5 then
+    frente.furia = true
+    table.insert(partes, "¡" .. frente.nombre .. " entra en FURIA! Ahora golpea más fuerte.")
+  end
+
+  local recibido, extra = 0, 0
+  for i, en in ipairs(c.enemigos) do
+    local d, txt = ataqueEnemigo(pt, c, en, (i == 1) and 1 or 0.3)
+    if i == 1 then
+      if txt then table.insert(partes, txt) end
+      recibido = recibido + d
+    else
+      extra = extra + d
+    end
+  end
+  if extra > 0 then
+    table.insert(partes, "Los demás enemigos disparan desde atrás.")
+    recibido = recibido + extra
+  end
+  pt.vida = pt.vida - recibido
+  c.cubierto = false
+  if c.whisky > 0 then
+    c.whisky = c.whisky - 1
+    if c.whisky == 0 then table.insert(partes, "Se te pasa el efecto del whisky.") end
+  end
+  if recibido > 0 then
+    reproducirEfecto("snd_golpe", true)
+    table.insert(partes, "Recibes " .. recibido .. " de daño.")
+  end
+  if pt.vida <= 0 then
+    guardarPartida()
+    muerte(table.concat(partes, "\n"))
+    return
+  end
+  guardarPartida()
+  c.turno = c.turno + 1
+  mostrarCombate(table.concat(partes, "\n"))
+end
+
+local function accionDisparar()
+  local pt, c = p(), combate
+  if not c then mostrarMenu() return end
+  local arma = armaActual(pt)
+  reproducirEfecto(arma.snd or "snd_revolver")
+
+  local total, crits, fallos, impactos = 0, 0, 0, 0
+  local caidos = {}
+  local aturdido = false
+  for s = 1, arma.disparos do
+    local en = c.enemigos[1]
+    if not en then break end
+    local d, crit, fallo = disparoJugador(pt, c, en, arma, (s == 1) and c.apuntando)
+    if fallo then
+      fallos = fallos + 1
+    else
+      impactos = impactos + 1
+      en.vida = en.vida - d
+      total = total + d
+      if crit then crits = crits + 1 pt.stats.criticos = pt.stats.criticos + 1 end
+      if en.vida <= 0 then
+        table.insert(caidos, en.nombre)
+        registrarBaja(pt, en)
+        table.remove(c.enemigos, 1)
+      elseif arma.aturdir > 0 and math.random(100) <= arma.aturdir then
+        en.aturdido = true
+        aturdido = true
+      end
+    end
+  end
+  c.apuntando = false
+  pt.stats.dano_total = pt.stats.dano_total + total
+  if crits > 0 then reproducirEfecto("snd_critico", true) end
+
+  local msg = "Disparas con " .. arma.nombre .. ": "
+  if arma.disparos == 1 then
+    if fallos > 0 then msg = msg .. "¡fallas, el enemigo esquiva!"
+    else msg = msg .. total .. " de daño" .. (crits > 0 and ". ¡GOLPE CRÍTICO!" or ".") end
+  else
+    msg = msg .. impactos .. " de " .. arma.disparos .. " disparos aciertan, " .. total .. " de daño" .. (crits > 0 and (", " .. crits .. " crítico(s)") or "") .. "."
+  end
+  local partes = { msg }
+  if #caidos > 0 then table.insert(partes, "Abates a: " .. table.concat(caidos, ", ") .. ".") end
+  if aturdido then table.insert(partes, "¡El impacto deja aturdido al enemigo!") end
+  finTurno(partes)
+end
+
+local function accionApuntar()
+  if not combate then mostrarMenu() return end
+  combate.apuntando = true
+  finTurno({ "Apuntas con calma. Tu próximo disparo será crítico y no fallará." })
+end
+
+local function accionCubrirse()
+  if not combate then mostrarMenu() return end
+  combate.cubierto = true
+  finTurno({ "Te cubres tras una roca. El daño que recibas este turno se reduce un 60%." })
+end
+
+local function accionDinamita()
+  local pt, c = p(), combate
+  if not c then mostrarMenu() return end
+  if pt.dinamitas <= 0 then hablar("No tienes dinamita.") return end
+  pt.dinamitas = pt.dinamitas - 1
+  pt.stats.dinamitas_usadas = pt.stats.dinamitas_usadas + 1
+  reproducirEfecto("snd_dinamita")
+  local basedano = 55 + pt.rango * 5 + pt.hab.punteria * 2
+  local vivos, total, caidos = {}, 0, 0
+  for _, en in ipairs(c.enemigos) do
+    local d = ent(basedano * (0.9 + math.random() * 0.2) * (en.jefe and 0.7 or 1))
+    en.vida = en.vida - d
+    total = total + d
+    if en.vida > 0 then
+      table.insert(vivos, en)
+    else
+      caidos = caidos + 1
+      registrarBaja(pt, en)
+    end
+  end
+  c.enemigos = vivos
+  pt.stats.dano_total = pt.stats.dano_total + total
+  finTurno({ "¡Lanzas dinamita! La explosión causa " .. total .. " de daño en total y derriba a " .. caidos .. " enemigo(s)." })
+end
+
+local function accionWhisky()
+  local pt, c = p(), combate
+  if not c then mostrarMenu() return end
+  if pt.whisky <= 0 then hablar("No tienes whisky.") return end
+  pt.whisky = pt.whisky - 1
+  c.whisky = 4
+  finTurno({ "Te echas un trago de whisky: +30% de daño durante 4 turnos." })
+end
+
+local function accionBotiquin()
+  local pt, c = p(), combate
+  if not c then mostrarMenu() return end
+  if pt.botiquines <= 0 then hablar("No tienes botiquines.") return end
+  pt.botiquines = pt.botiquines - 1
+  local cura = math.min(curaBot(pt), pt.vida_max - pt.vida)
+  pt.vida = pt.vida + cura
+  reproducirEfecto("snd_curar", true)
+  finTurno({ "Usas un botiquín y recuperas " .. cura .. " de vida. El enemigo aprovecha el momento." })
+end
+
+local function accionHuir()
+  local pt, c = p(), combate
+  if not c then mostrarMenu() return end
+  local prob = 45 + (pt.caballo and 30 or 0) + pt.hab.reflejos * 2
+  if c.jefe then prob = ent(prob / 2) end
+  prob = math.min(90, prob)
+  if math.random(100) <= prob then
+    local fn = c.alHuir
+    combate = nil
+    hablar("Escapaste con vida.")
+    fn()
+  else
+    finTurno({ "Intentas huir, pero te cierran el paso." })
+  end
+end
+
+local function accionCambiarArma()
+  elegirArma(function(a)
+    mostrarCombate(a and ("Cambias a " .. a.nombre .. ". No pierdes el turno.") or "Sigues con tu arma.")
+  end)
+end
+
+function botonesCombate()
+  local pt, c = p(), combate
+  local arma = armaActual(pt)
+  local bots = {
+    { "Disparar con " .. arma.nombre .. " (" .. descArma(arma) .. ")", accionDisparar },
+    { "Apuntar: próximo disparo crítico seguro", accionApuntar },
+    { "Cubrirse: reduce 60% el daño este turno", accionCubrirse },
+  }
+  if pt.dinamitas > 0 then table.insert(bots, { "Lanzar dinamita (" .. pt.dinamitas .. "): daño a todos", accionDinamita }) end
+  if pt.whisky > 0 and c.whisky == 0 then table.insert(bots, { "Beber whisky (" .. pt.whisky .. "): +30% daño", accionWhisky }) end
+  if pt.botiquines > 0 and pt.vida < pt.vida_max then
+    table.insert(bots, { "Usar botiquín (" .. pt.botiquines .. ")", accionBotiquin })
+  end
+  if #pt.inventario_armas > 1 then table.insert(bots, { "Cambiar de arma (gratis)", accionCambiarArma }) end
+  table.insert(bots, { "Huir", accionHuir })
+  return bots
+end
+
+local function iniciarCombate(cfg)
+  combate = {
+    tipo = cfg.tipo, titulo = cfg.titulo, enemigos = cfg.enemigos, turno = 1,
+    apuntando = false, cubierto = false, whisky = 0, jefe = cfg.jefe,
+    alVencer = cfg.alVencer, alHuir = cfg.alHuir,
+  }
+  if cfg.jefe then cambiarMusica("jefe_music")
+  elseif cfg.tipo == "horda" then cambiarMusica("horda_music")
+  else cambiarMusica("combate_music") end
+  mostrarCombate(cfg.intro)
+end
+
+function victoriaCombate(partes)
+  local pt, c = p(), combate
+  combate = nil
+  pt.victorias = pt.victorias + 1
+  reproducirEfecto("victoria", true)
+  table.insert(partes, "¡Todos los enemigos han caído!")
+  guardarPartida()
+  c.alVencer(table.concat(partes, "\n"))
+end
+
+function muerte(previo)
+  local pt = p()
+  combate = nil
+  viaje = nil
+  detenerMusica()
+  reproducirEfecto("snd_derrota")
+  pt.vida = 0
+  pt.muertes = pt.muertes + 1
+  local extra = ""
+  if horda then
+    local d = ent(horda.botin_d * 0.4)
+    local xp = ent(horda.botin_xp * 0.4)
+    sumarDiamantes(pt, d)
+    extra = "\nDel botín de la horda conservas el 40%: " .. d .. " diamantes y " .. xp .. " XP." .. dar_xp(pt, xp)
+    horda = nil
+  end
+  extra = extra .. revisarLogros(pt)
+  guardarPartida()
+  mostrarLayout("Has muerto", (previo or "") .. "\nTus heridas te obligan a reaparecer." .. extra .. "\n\nDiamantes: " .. pt.diamantes, {
+    { "Revivir (" .. COSTO_REVIVIR .. " diamantes, vida al 70%)", function()
+        if pt.diamantes < COSTO_REVIVIR then hablar("Diamantes insuficientes.") return end
+        pt.diamantes = pt.diamantes - COSTO_REVIVIR
+        pt.vida = ent(pt.vida_max * 0.7)
+        guardarPartida()
+        mostrarMenu()
+      end },
+    { "Regresar al pueblo (vida al 30%)", function()
+        pt.vida = math.max(30, ent(pt.vida_max * 0.3))
+        guardarPartida()
+        mostrarMenu()
+      end },
+  })
+  hablar("Has muerto en combate.")
+end
+
+-- ============================================================
+--  CAMPAÑA: 15 NIVELES DE 3 ETAPAS CON EVENTOS
+-- ============================================================
+function seleccionarNivel()
+  cambiarMusica("lobby_music")
+  local pt = p()
+  local bots = {}
+  for r = 1, 10 do
+    local desde, hasta = (r - 1) * 10 + 1, r * 10
+    local hechos = math.max(0, math.min(10, pt.nivel_actual - desde))
+    local texto = "Región " .. r .. ": " .. REGIONES[r][1] .. " (niveles " .. desde .. " al " .. hasta .. ")"
+    local bloqueada = desde > pt.nivel_actual
+    texto = texto .. (bloqueada and " - Bloqueada" or (" - " .. hechos .. " de 10 superados"))
+    table.insert(bots, { texto, function()
+        if bloqueada then hablar("Región bloqueada. Supera los niveles anteriores.") return end
+        MD.region(r)
+      end })
+  end
+  table.insert(bots, { "Volver", function() MD.modos() end })
+  mostrarLayout("Campaña: 100 niveles", "10 regiones de 10 niveles. Cada nivel tiene 3 etapas con combates y eventos, y cada 5 niveles te espera un jefe.\nPuedes repetir los niveles superados.\n\n" .. hud(), bots)
+  hablar("Campaña. Tienes disponibles los niveles del 1 al " .. pt.nivel_actual .. ".")
+end
+
+function iniciarNivel(num)
+  viaje = { nivel = num, etapa = 0, etapas = 3 }
+  cambiarMusica("combate_music")
+  local z = zonaDe(num)
+  local extra = jefeDe(num) and ("\n\n⚠ Al final te espera el jefe " .. jefeDe(num) .. ".") or ""
+  mostrarLayout("Nivel " .. num .. ": " .. z[1], z[2] .. "\nEl nivel tiene 3 etapas." .. extra .. "\n\n" .. hud(), {
+    { "Adentrarse en el nivel", avanzarEtapa },
+    { "Volver", seleccionarNivel },
+  })
+  hablar("Nivel " .. num .. ", " .. z[1] .. ". " .. z[2])
+end
+
+local function campanaVencida(txt)
+  local pt, v = p(), viaje
+  if not v then mostrarMenu() return end
+  local n = v.nivel
+  local final = v.etapa >= v.etapas
+  local d, xp
+  if final then
+    d = 8 + n * 2 + math.random(0, 5)
+    xp = 30 + n * 12
+    if v.jefe_final then d = d + 15 + n xp = xp + 40 end
+  else
+    d = math.random(1, 3) + math.floor(n / 3)
+    xp = 8 + n * 2
+  end
+  local real = ganarDiamantes(pt, d)
+  txt = txt .. "\n💎 +" .. real .. " diamantes, ✨ +" .. xp .. " XP." .. dar_xp(pt, xp)
+
+  if not final then
+    guardarPartida()
+    pausaViaje(txt)
+    return
+  end
+
+  if n >= pt.nivel_actual and pt.nivel_actual < MAX_NIVELES then
+    pt.nivel_actual = pt.nivel_actual + 1
+    txt = txt .. "\n🔓 ¡Desbloqueas el nivel " .. pt.nivel_actual .. "!"
+  end
+  if n == MAX_NIVELES then pt.campana_completa = true txt = txt .. "\n👑 ¡Has completado toda la campaña!" end
+  txt = txt .. revisarLogros(pt)
+  viaje = nil
+  guardarPartida()
+  cambiarMusica("lobby_music")
+  local bots = {}
+  if n < MAX_NIVELES and n + 1 <= pt.nivel_actual then
+    table.insert(bots, { "Jugar el nivel " .. (n + 1), function() iniciarNivel(n + 1) end })
+  end
+  table.insert(bots, { "Volver al menú", mostrarMenu })
+  mostrarLayout("¡Nivel " .. n .. " superado!", txt .. "\n\n" .. hud(), bots)
+  hablar("¡Nivel " .. n .. " superado!")
+end
+
+function pausaViaje(txt)
+  local pt, v = p(), viaje
+  if not v then mostrarMenu() return end
+  local bots = { { "Continuar explorando (etapa " .. math.min(v.etapas, v.etapa + 1) .. " de " .. v.etapas .. ")", avanzarEtapa } }
+  if pt.botiquines > 0 and pt.vida < pt.vida_max then
+    table.insert(bots, { "Usar botiquín (" .. pt.botiquines .. ")", function()
+        pt.botiquines = pt.botiquines - 1
+        local cura = math.min(curaBot(pt), pt.vida_max - pt.vida)
+        pt.vida = pt.vida + cura
+        reproducirEfecto("snd_curar", true)
+        guardarPartida()
+        pausaViaje("Te curas " .. cura .. " de vida.")
+      end })
+  end
+  table.insert(bots, { "Retirarme al pueblo", function() viaje = nil mostrarMenu() end })
+  mostrarLayout("Nivel " .. v.nivel .. " - Etapa " .. v.etapa .. " de " .. v.etapas, (txt or "") .. "\n\n" .. hud(), bots)
+  hablar(txt or "Continúas tu camino.")
+end
+
+function comenzarCombateNivel(final, intro_ev)
+  local v = viaje
+  if not v then mostrarMenu() return end
+  local n = v.nivel
+  local hp, atk = escala(n)
+  local enemigos, jefe, intro = {}, false, nil
+  if final then
+    local nombre_jefe = jefeDe(n)
+    if nombre_jefe then
+      jefe = true
+      table.insert(enemigos, crearJefe(nombre_jefe, hp * 3.0, atk * 1.25))
+      if n >= 10 then table.insert(enemigos, crearEnemigo(tipoAleatorio(n), hp, atk)) end
+      intro = "¡Aparece el jefe " .. nombre_jefe .. "! Prepárate."
+    else
+      local cnt = (n >= 60) and 4 or ((n >= 10) and 3 or ((n >= 5) and 2 or 1))
+      for _ = 1, cnt do table.insert(enemigos, crearEnemigo(tipoAleatorio(n), hp * 1.15, atk * 1.05)) end
+      intro = "¡Enfrentamiento final del nivel! Hay " .. cnt .. " enemigo(s) de élite."
+    end
+  else
+    local cnt = 1 + ((n >= 4) and math.random(0, 1) or 0) + ((n >= 10) and math.random(0, 1) or 0)
+    for _ = 1, cnt do table.insert(enemigos, crearEnemigo(tipoAleatorio(n), hp, atk)) end
+    intro = intro_ev or ("¡Te salen al paso " .. cnt .. " enemigo(s)!")
+  end
+  v.jefe_final = jefe
+  iniciarCombate({
+    tipo = "campana", titulo = "Nivel " .. n .. " - Etapa " .. v.etapa .. "/" .. v.etapas,
+    enemigos = enemigos, jefe = jefe, intro = intro,
+    alVencer = campanaVencida,
+    alHuir = function() viaje = nil cambiarMusica("lobby_music") mostrarMenu() end,
+  })
+end
+
+-- Eventos aleatorios de exploración
+local EV = {}
+local EV_LISTA = { "cofre", "viajero", "comerciante", "campamento", "poker", "emboscada", "ermitano" }
+
+EV.cofre = function()
+  local pt, v = p(), viaje
+  mostrarLayout("Cofre abandonado", "Entre la maleza ves un viejo cofre cubierto de musgo. ¿Lo abres?", {
+    { "Abrir el cofre", function()
+        local r = math.random(100)
+        local txt
+        if r <= 55 then
+          local d = ganarDiamantes(pt, math.random(5, 12) + v.nivel)
+          txt = "¡Dentro hay " .. d .. " diamantes!"
+          reproducirEfecto("snd_moneda")
+        elseif r <= 75 then
+          pt.botiquines = pt.botiquines + 1
+          txt = "Encuentras un botiquín intacto."
+        elseif r <= 85 then
+          pt.dinamitas = pt.dinamitas + 1
+          txt = "Encuentras un cartucho de dinamita."
+        else
+          local d = math.random(10, 20) + v.nivel
+          pt.vida = math.max(1, pt.vida - d)
+          reproducirEfecto("snd_golpe")
+          txt = "¡Era una trampa! Pierdes " .. d .. " de vida."
+        end
+        guardarPartida()
+        pausaViaje(txt)
+      end },
+    { "Ignorarlo", function() pausaViaje("Decides no arriesgarte y sigues adelante.") end },
+  })
+  hablar("Evento: cofre abandonado.")
+end
+
+EV.viajero = function()
+  local pt, v = p(), viaje
+  mostrarLayout("Viajero herido", "Un viajero herido te pide ayuda junto al camino.", {
+    { "Ayudarlo con un botiquín", function()
+        if pt.botiquines <= 0 then hablar("No tienes botiquines.") return end
+        pt.botiquines = pt.botiquines - 1
+        local d = ganarDiamantes(pt, 12 + v.nivel)
+        local xp = 15 + v.nivel * 2
+        local txt = "El viajero te agradece: +" .. d .. " diamantes y +" .. xp .. " XP." .. dar_xp(pt, xp)
+        reproducirEfecto("snd_moneda")
+        guardarPartida()
+        pausaViaje(txt)
+      end },
+    { "Seguir tu camino", function() pausaViaje("Sigues tu camino sin mirar atrás.") end },
+  })
+  hablar("Evento: viajero herido.")
+end
+
+EV.comerciante = function(msg)
+  local pt = p()
+  mostrarLayout("Comerciante ambulante", (msg or "Un comerciante con su carreta te ofrece mercancía.") .. "\nDiamantes: " .. pt.diamantes, {
+    { "Comprar botiquín - 6 diamantes (tienes " .. pt.botiquines .. ")", function()
+        if pt.diamantes < 6 then hablar("Diamantes insuficientes.") return end
+        pt.diamantes = pt.diamantes - 6 pt.botiquines = pt.botiquines + 1
+        guardarPartida() EV.comerciante("Compraste un botiquín.")
+      end },
+    { "Comprar dinamita - 5 diamantes (tienes " .. pt.dinamitas .. ")", function()
+        if pt.diamantes < 5 then hablar("Diamantes insuficientes.") return end
+        pt.diamantes = pt.diamantes - 5 pt.dinamitas = pt.dinamitas + 1
+        guardarPartida() EV.comerciante("Compraste dinamita.")
+      end },
+    { "Seguir camino", function() pausaViaje("Te despides del comerciante.") end },
+  })
+  hablar(msg or "Evento: comerciante ambulante.")
+end
+
+EV.campamento = function()
+  local pt = p()
+  mostrarLayout("Campamento abandonado", "Encuentras un campamento con la hoguera aún tibia.", {
+    { "Descansar junto al fuego (recuperas 30% de vida)", function()
+        if math.random(100) <= 25 then
+          comenzarCombateNivel(false, "¡Mientras descansabas te han rodeado! ¡Emboscada!")
+          return
+        end
+        pt.vida = math.min(pt.vida_max, pt.vida + ent(pt.vida_max * 0.3))
+        guardarPartida()
+        pausaViaje("Descansas un rato y recuperas fuerzas.")
+      end },
+    { "Registrar las mochilas", function()
+        local d = ganarDiamantes(pt, math.random(3, 9))
+        guardarPartida()
+        pausaViaje("Entre las mochilas encuentras " .. d .. " diamantes.")
+      end },
+    { "Seguir adelante", function() pausaViaje("No te detienes.") end },
+  })
+  hablar("Evento: campamento abandonado.")
+end
+
+EV.poker = function()
+  local pt = p()
+  if pt.diamantes < 10 then pausaViaje("Un jugador te invita a su mesa de póker, pero no tienes diamantes para apostar.") return end
+  mostrarLayout("Mesa de póker", "Un tahúr te reta a una partida rápida. Apuestas 10 diamantes: 45% de ganar el doble.", {
+    { "Apostar 10 diamantes", function()
+        local txt
+        if math.random(100) <= 45 then
+          sumarDiamantes(pt, 10)
+          reproducirEfecto("snd_moneda")
+          txt = "¡Ganas la mano! +10 diamantes."
+        else
+          pt.diamantes = pt.diamantes - 10
+          txt = "Pierdes la mano. -10 diamantes."
+        end
+        guardarPartida()
+        pausaViaje(txt)
+      end },
+    { "Rechazar", function() pausaViaje("Rechazas la apuesta con una sonrisa.") end },
+  })
+  hablar("Evento: mesa de póker.")
+end
+
+EV.emboscada = function()
+  hablar("¡Emboscada!")
+  comenzarCombateNivel(false, "¡Emboscada! Los enemigos saltan desde los arbustos.")
+end
+
+EV.ermitano = function()
+  local pt, v = p(), viaje
+  mostrarLayout("Ermitaño del bosque", "Un anciano ermitaño te ofrece un trago y consejos de supervivencia.", {
+    { "Escuchar sus historias", function()
+        local xp = 15 + v.nivel * 3
+        pt.whisky = math.min(10, pt.whisky + 1)
+        guardarPartida()
+        pausaViaje("Aprendes mucho: +" .. xp .. " XP y te regala una botella de whisky." .. dar_xp(pt, xp))
+      end },
+    { "Seguir tu camino", function() pausaViaje("Te despides del ermitaño.") end },
+  })
+  hablar("Evento: ermitaño del bosque.")
+end
+
+function avanzarEtapa()
+  local v = viaje
+  if not v then mostrarMenu() return end
+  v.etapa = v.etapa + 1
+  if v.etapa >= v.etapas then
+    comenzarCombateNivel(true)
+  elseif math.random(100) <= 45 then
+    EV[EV_LISTA[math.random(#EV_LISTA)]]()
+  else
+    comenzarCombateNivel(false)
+  end
+end
+
+-- ============================================================
+--  MODO SUPERVIVENCIA (HORDA)
+-- ============================================================
+local function hordaVencida(txt)
+  local pt, h = p(), horda
+  if not h then mostrarMenu() return end
+  local n = h.oleada
+  local d = 4 + n * 2
+  local xp = 12 + n * 4
+  if n % 5 == 0 then d = d + 10 + n xp = xp + 30 end
+  local etiqueta, curapct = "Oleada", 0.15
+  if h.modo == "torre" then
+    d = 10 + n * 3
+    xp = 20 + n * 6
+    etiqueta, curapct = "Piso", 0.25
+    if n > pt.stats.torre_max then pt.stats.torre_max = n end
+  elseif n > pt.stats.mejor_oleada then
+    pt.stats.mejor_oleada = n
+  end
+  h.botin_d = h.botin_d + d
+  h.botin_xp = h.botin_xp + xp
+  h.superadas = n
+  local cura = math.min(pt.vida_max - pt.vida, ent(pt.vida_max * curapct))
+  pt.vida = pt.vida + cura
+  guardarPartida()
+
+  local function pantalla(t)
+    local bots = { { "Siguiente " .. string.lower(etiqueta) .. " (" .. (n + 1) .. ")", siguienteOleada } }
+    if pt.botiquines > 0 and pt.vida < pt.vida_max then
+      table.insert(bots, { "Usar botiquín (" .. pt.botiquines .. ")", function()
+          pt.botiquines = pt.botiquines - 1
+          local c2 = math.min(curaBot(pt), pt.vida_max - pt.vida)
+          pt.vida = pt.vida + c2
+          reproducirEfecto("snd_curar", true)
+          guardarPartida()
+          pantalla("Te curas " .. c2 .. " de vida.")
+        end })
+    end
+    table.insert(bots, { "Retirarme con el botín (" .. h.botin_d .. " diamantes, " .. h.botin_xp .. " XP)", retirarHorda })
+    mostrarLayout(etiqueta .. " " .. n .. " superado", t .. "\n\nBotín acumulado: " .. h.botin_d .. " diamantes y " .. h.botin_xp .. " XP.\nSi mueres, solo conservarás el 40%.\n\n" .. hud(), bots)
+  end
+
+  pantalla(txt .. "\nRecuperas " .. cura .. " de vida entre rondas.")
+  hablar(etiqueta .. " " .. n .. " superado. Botín acumulado: " .. h.botin_d .. " diamantes.")
+end
+
+function siguienteOleada()
+  local pt, h = p(), horda
+  if not h then mostrarMenu() return end
+  h.oleada = h.oleada + 1
+  local n = h.oleada
+  if h.modo == "torre" then MD.pisoTorre(h, n) return end
+  local hp = 40 + n * 14
+  local atk = 9 + n * 2.2
+  local enemigos, jefe, intro = {}, false, nil
+  if n % 5 == 0 then
+    jefe = true
+    local nombre = JEFES_HORDA[(math.floor(n / 5) - 1) % #JEFES_HORDA + 1]
+    table.insert(enemigos, crearJefe(nombre, hp * 3.0, atk * 1.25))
+    for _ = 1, math.min(2, math.floor(n / 10)) do table.insert(enemigos, crearEnemigo(tipoAleatorio(n + 1), hp, atk)) end
+    intro = "¡Oleada " .. n .. "! Llega el jefe " .. nombre .. "."
+  else
+    local cnt = math.min(4, 1 + math.floor(n / 3))
+    for _ = 1, cnt do table.insert(enemigos, crearEnemigo(tipoAleatorio(n + 1), hp, atk)) end
+    intro = "¡Oleada " .. n .. "! Se acercan " .. cnt .. " enemigo(s)."
+  end
+  iniciarCombate({
+    tipo = "horda", titulo = "Supervivencia - Oleada " .. n,
+    enemigos = enemigos, jefe = jefe, intro = intro,
+    alVencer = hordaVencida,
+    alHuir = function() retirarHorda() end,
+  })
+end
+
+function retirarHorda()
+  local pt, h = p(), horda
+  horda = nil
+  combate = nil
+  if not h then mostrarMenu() return end
+  local d = ganarDiamantes(pt, h.botin_d)
+  local txt = "Te retiras con vida tras superar " .. (h.superadas or 0) .. (h.modo == "torre" and " piso(s)" or " oleada(s)") .. ".\n💎 +" .. d .. " diamantes, ✨ +" .. h.botin_xp .. " XP." .. dar_xp(pt, h.botin_xp)
+  txt = txt .. revisarLogros(pt)
+  guardarPartida()
+  cambiarMusica("lobby_music")
+  mostrarLayout("Fin de la supervivencia", txt .. "\n\n" .. hud(), { { "Volver al menú", mostrarMenu } })
+  hablar("Te retiras con el botín.")
+end
+
+function menuModoHorda()
+  cambiarMusica("horda_music")
+  local pt = p()
+  mostrarLayout("Modo Supervivencia", "Oleadas interminables de forajidos. Cada 5 oleadas aparece un jefe.\nEntre oleadas recuperas algo de vida y acumulas botín.\nSi te retiras conservas todo el botín; si mueres, solo el 40%.\n\nTu mejor oleada: " .. pt.stats.mejor_oleada .. "\n\n" .. hud(), {
+    { "Comenzar supervivencia", function()
+        horda = { oleada = 0, botin_d = 0, botin_xp = 0, superadas = 0 }
+        siguienteOleada()
+      end },
+    { "Volver al menú", mostrarMenu },
+  })
+  hablar("Modo supervivencia. Tu mejor oleada es " .. pt.stats.mejor_oleada .. ".")
+end
+
+-- ============================================================
+--  ARMERÍA, MEJORAS Y ALMACÉN
+-- ============================================================
+function elegirArma(retorno)
+  local pt = p()
+  local bots = {}
+  for i, inv in ipairs(pt.inventario_armas) do
+    local a = datosArma(pt, inv)
+    table.insert(bots, { (i == pt.arma_equipada_idx and "[Equipada] " or "") .. a.nombre .. " - " .. descArma(a) .. ". " .. a.rasgo, function()
+        pt.arma_equipada_idx = i
+        guardarPartida()
+        hablar("Equipas " .. a.nombre)
+        retorno(a)
+      end })
+  end
+  table.insert(bots, { "Volver", function() retorno(nil) end })
+  mostrarLayout("Elegir arma", "Toca un arma para equiparla.", bots)
+end
+
+function mostrarArmeria(msg)
+  local pt = p()
+  local bots = {}
+  for _, arm in ipairs(ARMAS) do
+    if arm.costo > 0 then
+      local tiene = tieneArma(pt, arm.nombre)
+      local etiqueta = arm.nombre .. " (" .. descArma({ dano = arm.dano, disparos = arm.disparos, nivel = 0 }) .. ") - " .. (tiene and "COMPRADA" or (arm.costo .. " diamantes")) .. ". " .. arm.rasgo .. (arm.req and (" Requiere haber llegado al nivel " .. arm.req .. " de la campaña.") or "")
+      table.insert(bots, { etiqueta, function()
+          if tiene then hablar("Ya posees esta arma. Puedes equiparla o mejorarla.") return end
+          if arm.req and pt.nivel_actual < arm.req then hablar("Necesitas llegar al nivel " .. arm.req .. " de la campaña para comprarla.") return end
+          if pt.diamantes < arm.costo then hablar("No tienes suficientes diamantes.") return end
+          pt.diamantes = pt.diamantes - arm.costo
+          table.insert(pt.inventario_armas, { nombre = arm.nombre, dano = arm.dano, disparos = arm.disparos or 1, crit = arm.crit or 0 })
+          pt.arma_equipada_idx = #pt.inventario_armas
+          local lg = revisarLogros(pt)
+          guardarPartida()
+          reproducirEfecto("victoria", true)
+          mostrarArmeria("¡Has comprado y equipado la " .. arm.nombre .. "!" .. lg)
+        end })
+    end
+  end
+  table.insert(bots, { "Equipar otra arma", function() elegirArma(function() mostrarArmeria() end) end })
+  table.insert(bots, { "Herrería: mejorar armas", function() mostrarMejoras() end })
+  table.insert(bots, { "Volver", mostrarMenu })
+  mostrarLayout("Armería Legendaria", (msg and (msg .. "\n\n") or "") .. "Todas tus armas se acumulan.\nDiamantes: " .. pt.diamantes, bots)
+  hablar(msg or ("Armería abierta. Tienes " .. pt.diamantes .. " diamantes."))
+end
+
+function mostrarMejoras(msg)
+  local pt = p()
+  local bots = {}
+  for _, inv in ipairs(pt.inventario_armas) do
+    local b = ARMA_POR_NOMBRE[inv.nombre]
+    if b then
+      local lvl = pt.mejoras[b.nombre] or 0
+      if lvl >= MAX_MEJORA then
+        table.insert(bots, { b.nombre .. ": mejora al máximo (nivel " .. MAX_MEJORA .. ")", function() hablar("Esta arma ya está al máximo.") end })
+      else
+        local costo = (15 + ent(b.costo * 0.25)) * (lvl + 1)
+        table.insert(bots, { "Mejorar " .. b.nombre .. " al nivel " .. (lvl + 1) .. " (+15% de daño) - " .. costo .. " diamantes", function()
+            if pt.diamantes < costo then hablar("No tienes suficientes diamantes.") return end
+            pt.diamantes = pt.diamantes - costo
+            pt.mejoras[b.nombre] = lvl + 1
+            guardarPartida()
+            reproducirEfecto("snd_nivel", true)
+            mostrarMejoras("¡" .. b.nombre .. " mejorada al nivel " .. (lvl + 1) .. "!")
+          end })
+      end
+    end
+  end
+  table.insert(bots, { "Volver a la armería", function() mostrarArmeria() end })
+  mostrarLayout("Herrería", (msg and (msg .. "\n\n") or "") .. "Cada mejora da +15% de daño base al arma.\nDiamantes: " .. pt.diamantes, bots)
+  hablar(msg or "Herrería abierta.")
+end
+
+function mostrarAlmacen(msg)
+  local pt = p()
+  local bots = {}
+  local items = {
+    { nombre = "Botiquín (cura 35% de tu vida)", costo = COSTO_BOTIQUIN, campo = "botiquines" },
+    { nombre = "Dinamita (daño a todos los enemigos)", costo = COSTO_DINAMITA, campo = "dinamitas" },
+    { nombre = "Whisky (+30% de daño durante 4 turnos)", costo = COSTO_WHISKY, campo = "whisky" },
+  }
+  for _, it in ipairs(items) do
+    table.insert(bots, { it.nombre .. " - " .. it.costo .. " diamantes (tienes " .. pt[it.campo] .. ")", function()
+        if pt[it.campo] >= 10 then hablar("Ya llevas el máximo de 10.") return end
+        if pt.diamantes < it.costo then hablar("Diamantes insuficientes.") return end
+        pt.diamantes = pt.diamantes - it.costo
+        pt[it.campo] = pt[it.campo] + 1
+        guardarPartida()
+        reproducirEfecto("snd_moneda")
+        mostrarAlmacen("Compraste: " .. it.nombre .. ".")
+      end })
+  end
+  if pt.armadura < MAX_ARMADURA then
+    local costo = 20 * (pt.armadura + 1)
+    table.insert(bots, { "Chaleco de cuero nivel " .. (pt.armadura + 1) .. " (-3 de daño y -2% por golpe recibido) - " .. costo .. " diamantes", function()
+        if pt.diamantes < costo then hablar("Diamantes insuficientes.") return end
+        pt.diamantes = pt.diamantes - costo
+        pt.armadura = pt.armadura + 1
+        local lg = revisarLogros(pt)
+        guardarPartida()
+        reproducirEfecto("snd_moneda")
+        mostrarAlmacen("Mejoraste tu chaleco al nivel " .. pt.armadura .. "." .. lg)
+      end })
+  end
+  table.insert(bots, { "Volver", mostrarMenu })
+  mostrarLayout("Almacén General", (msg and (msg .. "\n\n") or "") .. "Diamantes: " .. pt.diamantes .. "\nChaleco nivel " .. pt.armadura .. " de " .. MAX_ARMADURA, bots)
+  hablar(msg or ("Almacén general. Tienes " .. pt.diamantes .. " diamantes."))
+end
+
+-- ============================================================
+--  ESTABLO, CABAÑA Y BANCO
+-- ============================================================
+function mostrarEstablo(msg)
+  local pt = p()
+  if not pt.caballo then
+    mostrarLayout("Establo", "Un caballo te da +7% de esquiva, +30% de probabilidad de huir y te permite salir a cabalgar para encontrar tesoros.\nCosto: " .. COSTO_CABALLO .. " diamantes.", {
+      { "Comprar caballo", function()
+          if pt.diamantes < COSTO_CABALLO then hablar("Diamantes insuficientes.") return end
+          pt.diamantes = pt.diamantes - COSTO_CABALLO
+          pt.caballo = true
+          local lg = revisarLogros(pt)
+          guardarPartida()
+          mostrarEstablo("¡Compraste tu caballo!" .. lg)
+        end },
+      { "Volver", mostrarMenu },
+    })
+    hablar("Establo. Un caballo cuesta " .. COSTO_CABALLO .. " diamantes.")
+    return
+  end
+  mostrarLayout("Establo", (msg and (msg .. "\n\n") or "") .. "Tu caballo te da +7% de esquiva y +30% de probabilidad de huir.", {
+    { "Salir a cabalgar", function()
+        local resto = ESPERA_PASEO - (os.time() - pt.ultimo_paseo)
+        if resto > 0 then
+          mostrarEstablo("Tu caballo está cansado. Espera " .. math.ceil(resto / 60) .. " minuto(s) más.")
+          return
+        end
+        pt.ultimo_paseo = os.time()
+        local r = math.random(100)
+        local txt
+        if r <= 50 then
+          local d = ganarDiamantes(pt, math.random(4, 10) + pt.rango)
+          reproducirEfecto("snd_moneda")
+          txt = "Cabalgando encuentras una bolsa con " .. d .. " diamantes."
+        elseif r <= 75 then
+          pt.botiquines = math.min(10, pt.botiquines + 1)
+          txt = "Un viajero te regala un botiquín por escoltarlo."
+        elseif r <= 90 then
+          local xp = 15 + pt.rango * 3
+          txt = "Descubres un mirador y practicas tiro: +" .. xp .. " XP." .. dar_xp(pt, xp)
+        else
+          pt.vida = math.max(1, pt.vida - 10)
+          txt = "Un nido de serpientes asusta a tu caballo. Pierdes 10 de vida."
+        end
+        guardarPartida()
+        mostrarEstablo(txt)
+      end },
+    { "Volver", mostrarMenu },
+  })
+  hablar(msg or "Establo. Tu caballo te espera.")
+end
+
+function mostrarCasa(msg)
+  local pt = p()
+  if not pt.casa then
+    mostrarLayout("Cabaña", "Una cabaña te permite descansar y recuperar toda la vida gratis.\nCosto: " .. COSTO_CASA .. " diamantes.", {
+      { "Comprar cabaña", function()
+          if pt.diamantes < COSTO_CASA then hablar("Diamantes insuficientes.") return end
+          pt.diamantes = pt.diamantes - COSTO_CASA
+          pt.casa = true
+          local lg = revisarLogros(pt)
+          guardarPartida()
+          mostrarCasa("¡Compraste tu cabaña!" .. lg)
+        end },
+      { "Volver", mostrarMenu },
+    })
+    hablar("Cabaña a la venta por " .. COSTO_CASA .. " diamantes.")
+    return
+  end
+  cambiarMusica("lobby_music")
+  local n = 0
+  for _ in pairs(pt.logros) do n = n + 1 end
+  mostrarLayout("Tu Cabaña", (msg and (msg .. "\n\n") or "") .. "Vida: " .. pt.vida .. "/" .. pt.vida_max .. "\nTrofeos en la repisa: " .. n .. " logros.", {
+    { "Dormir en la cama (restaura toda la vida)", function()
+        pt.vida = pt.vida_max
+        guardarPartida()
+        reproducirEfecto("snd_curar", true)
+        mostrarCasa("Has descansado plácidamente. Vida al máximo.")
+      end },
+    { "Ver mis logros", function() mostrarLogros() end },
+    { "Volver", mostrarMenu },
+  })
+  hablar(msg or "Bienvenido a tu cabaña.")
+end
+
+local function aplicarInteres(pt)
+  if pt.banco <= 0 or pt.banco_t == 0 then pt.banco_t = os.time() return 0 end
+  local dias = math.floor((os.time() - pt.banco_t) / 86400)
+  if dias < 1 then return 0 end
+  dias = math.min(dias, 10)
+  local gan = math.min(40 * dias, math.floor(pt.banco * 0.03 * dias))
+  pt.banco_t = os.time()
+  pt.banco = pt.banco + gan
+  return gan
+end
+
+function mostrarBanco(msg)
+  local pt = p()
+  local gan = aplicarInteres(pt)
+  if gan > 0 then
+    msg = (msg and (msg .. "\n") or "") .. "💰 Tu dinero ha generado " .. gan .. " diamantes de interés (3% diario)."
+    guardarPartida()
+  end
+  local function depositar(c)
+    return function()
+      local cant = (c == 0) and pt.diamantes or c
+      if cant <= 0 or pt.diamantes < cant then hablar("No tienes suficientes diamantes.") return end
+      if pt.banco == 0 then pt.banco_t = os.time() end
+      pt.diamantes = pt.diamantes - cant
+      pt.banco = pt.banco + cant
+      local lg = revisarLogros(pt)
+      guardarPartida()
+      mostrarBanco("Depositaste " .. cant .. " diamantes." .. lg)
+    end
+  end
+  mostrarLayout("Banco del Pueblo", (msg and (msg .. "\n\n") or "") .. "En tu cuenta: " .. pt.banco .. " diamantes.\nEn tu bolsa: " .. pt.diamantes .. " diamantes.\nEl banco paga 3% de interés por cada día real (máx. 40 por día).", {
+    { "Depositar 25", depositar(25) },
+    { "Depositar 100", depositar(100) },
+    { "Depositar todo", depositar(0) },
+    { "Retirar todo", function()
+        if pt.banco <= 0 then hablar("No tienes nada en el banco.") return end
+        local cant = pt.banco
+        pt.banco = 0
+        pt.diamantes = pt.diamantes + cant
+        guardarPartida()
+        mostrarBanco("Retiraste " .. cant .. " diamantes.")
+      end },
+    { "Volver", mostrarMenu },
+  })
+  hablar(msg or ("Banco. Tienes " .. pt.banco .. " diamantes ahorrados."))
+end
+
+-- ============================================================
+--  HABILIDADES, LOGROS, ESTADÍSTICAS, FAMA Y AJUSTES
+-- ============================================================
+function mostrarHabilidades(msg)
+  local pt = p()
+  local bots = {}
+  for _, h in ipairs(HABS) do
+    table.insert(bots, { h.nombre .. " nivel " .. pt.hab[h.id] .. " de " .. MAX_NIVEL_HAB .. ": " .. h.desc, function()
+        if pt.hab[h.id] >= MAX_NIVEL_HAB then hablar("Esta habilidad ya está al máximo.") return end
+        if pt.puntos_hab <= 0 then hablar("No tienes puntos de habilidad. Sube de rango para ganar más.") return end
+        pt.puntos_hab = pt.puntos_hab - 1
+        pt.hab[h.id] = pt.hab[h.id] + 1
+        if h.id == "resistencia" then
+          recalcularVida(pt)
+          pt.vida = math.min(pt.vida_max, pt.vida + 15)
+        end
+        guardarPartida()
+        reproducirEfecto("snd_nivel", true)
+        mostrarHabilidades(h.nombre .. " sube al nivel " .. pt.hab[h.id] .. ".")
+      end })
+  end
+  table.insert(bots, { "Reiniciar habilidades (" .. COSTO_RESET_HAB .. " diamantes)", function()
+      local gastados = 0
+      for _, h in ipairs(HABS) do gastados = gastados + pt.hab[h.id] end
+      if gastados == 0 then hablar("No has gastado puntos todavía.") return end
+      if pt.diamantes < COSTO_RESET_HAB then hablar("Diamantes insuficientes.") return end
+      pt.diamantes = pt.diamantes - COSTO_RESET_HAB
+      for _, h in ipairs(HABS) do pt.hab[h.id] = 0 end
+      pt.puntos_hab = pt.puntos_hab + gastados
+      recalcularVida(pt)
+      pt.vida = math.min(pt.vida, pt.vida_max)
+      guardarPartida()
+      mostrarHabilidades("Habilidades reiniciadas. Recuperas " .. gastados .. " punto(s).")
+    end })
+  table.insert(bots, { "Volver", mostrarMenu })
+  mostrarLayout("Habilidades", (msg and (msg .. "\n\n") or "") .. "Puntos disponibles: " .. pt.puntos_hab .. "\nGanas 1 punto cada vez que subes de rango.", bots)
+  hablar(msg or ("Habilidades. Tienes " .. pt.puntos_hab .. " punto(s) disponibles."))
+end
+
+function mostrarLogros()
+  local pt = p()
+  local lineas, n = {}, 0
+  for _, l in ipairs(LOGROS) do
+    if pt.logros[l.id] then
+      n = n + 1
+      table.insert(lineas, "✅ " .. l.n .. ": " .. l.d)
+    else
+      table.insert(lineas, "🔒 " .. l.n .. ": " .. l.d .. " (premio " .. l.p .. " diamantes)")
+    end
+  end
+  mostrarLayout("Logros", "Desbloqueados: " .. n .. " de " .. #LOGROS .. "\n\n" .. table.concat(lineas, "\n"), { { "Volver", mostrarMenu } })
+  hablar("Has desbloqueado " .. n .. " de " .. #LOGROS .. " logros.")
+end
+
+function mostrarEstadisticas()
+  local pt = p()
+  local s = pt.stats
+  local txt = string.format(
+    "%s\nRango %d: %s\nXP: %d/%d | Puntos de habilidad: %d\n\nNivel de campaña alcanzado: %d de 15\nMejor oleada: %d\nEnemigos derrotados: %d\nJefes derrotados: %d\nCríticos: %d\nDaño total: %d\nVictorias: %d | Muertes: %d\nDiamantes ganados en total: %d\n\nHabilidades: Puntería %d, Reflejos %d, Resistencia %d, Fortuna %d",
+    session.nombre or "?", pt.rango, nombreRango(pt.rango), pt.xp, xpNecesaria(pt.rango), pt.puntos_hab,
+    pt.nivel_actual, s.mejor_oleada, s.kills, s.jefes, s.criticos, s.dano_total, pt.victorias, pt.muertes, s.diamantes_totales,
+    pt.hab.punteria, pt.hab.reflejos, pt.hab.resistencia, pt.hab.fortuna)
+  mostrarLayout("Mi Personaje", txt .. "\n\n" .. hud(), { { "Volver", mostrarMenu } })
+  hablar(session.nombre .. ", rango " .. pt.rango .. ", " .. nombreRango(pt.rango) .. ". Has derrotado a " .. s.kills .. " enemigos.")
+end
+
+function mostrarFama()
+  guardarPartida()
+  local db = cargarUsuarios()
+  local lista = {}
+  for u, cu in pairs(db) do
+    local pa = cu.partida
+    if type(pa) == "table" then
+      local rango = pa.rango or 1
+      local ola = (pa.stats and pa.stats.mejor_oleada) or 0
+      local pts = rango * 100 + (pa.nivel_actual or 1) * 20 + ola * 30 + (pa.victorias or 0)
+      table.insert(lista, { nombre = cu.nombre or u, rango = rango, ola = ola, pts = pts, yo = (u == session.usuario) })
+    end
+  end
+  table.sort(lista, function(a, b) return a.pts > b.pts end)
+  local lineas = {}
+  for i = 1, math.min(10, #lista) do
+    local e = lista[i]
+    table.insert(lineas, i .. ". " .. e.nombre .. (e.yo and " (tú)" or "") .. " - Rango " .. e.rango .. ", mejor oleada " .. e.ola .. ", " .. e.pts .. " puntos")
+  end
+  mostrarLayout("Salón de la Fama", "Los mejores vaqueros de este dispositivo.\nPuntos = rango x100 + nivel x20 + oleada x30 + victorias.\n\n" .. table.concat(lineas, "\n"), { { "Volver", mostrarMenu } })
+  hablar("Salón de la fama. " .. (lineas[1] or "Aún no hay jugadores."))
+end
+
+function recompensaDiaria()
+  local pt = p()
+  local hoy = os.date("%Y%m%d")
+  if pt.ultima_recompensa == hoy then
+    mostrarLayout("Recompensa diaria", "Ya reclamaste la recompensa de hoy. Vuelve mañana.\nRacha actual: " .. pt.racha .. " día(s).", { { "Volver", mostrarMenu } })
+    hablar("Ya reclamaste la recompensa de hoy.")
+    return
+  end
+  local ayer = os.date("%Y%m%d", os.time() - 86400)
+  if pt.ultima_recompensa == ayer then pt.racha = pt.racha + 1 else pt.racha = 1 end
+  pt.ultima_recompensa = hoy
+  local d = 10 + math.min(pt.racha, 7) * 5
+  sumarDiamantes(pt, d)
+  local txt = "🎁 ¡Recompensa del día " .. pt.racha .. " de racha!\n+" .. d .. " diamantes"
+  if pt.racha >= 3 then pt.botiquines = math.min(10, pt.botiquines + 1) txt = txt .. ", +1 botiquín" end
+  if pt.racha >= 5 then pt.dinamitas = math.min(10, pt.dinamitas + 1) txt = txt .. ", +1 dinamita" end
+  if pt.racha >= 7 then pt.whisky = math.min(10, pt.whisky + 1) txt = txt .. ", +1 whisky" end
+  txt = txt .. ", +20 XP." .. dar_xp(pt, 20) .. revisarLogros(pt)
+  guardarPartida()
+  reproducirEfecto("snd_moneda")
+  mostrarLayout("Recompensa diaria", txt .. "\n\nCuantos más días seguidos juegues, mejores premios.", { { "Volver", mostrarMenu } })
+  hablar("Recompensa diaria reclamada. Racha de " .. pt.racha .. " días. Ganaste " .. d .. " diamantes.")
+end
+
+function cambiarPassword()
+  local ids = {}
+  local cont = {
+    LinearLayout, orientation = "vertical", layout_width = "fill", padding = "14dp",
+    { TextView, text = "Contraseña actual:", layout_width = "fill" },
+    { EditText, id = "c_actual", hint = "Contraseña actual", inputType = 0x81, layout_width = "fill", layout_marginBottom = "10dp" },
+    { TextView, text = "Contraseña nueva:", layout_width = "fill" },
+    { EditText, id = "c_nueva", hint = "Mínimo 3 caracteres", inputType = 0x81, layout_width = "fill", layout_marginBottom = "15dp" },
+    { Button, text = "Cambiar contraseña", layout_width = "fill", layout_marginBottom = "6dp", onClick = function()
+        local actual = trim(tostring(ids.c_actual.getText()))
+        local nueva = trim(tostring(ids.c_nueva.getText()))
+        local db = cargarUsuarios()
+        local cuenta = db[session.usuario]
+        if not cuenta or (cuenta.hash ~= hashPass(actual, cuenta.sal) and cuenta.pass ~= actual) then
+          hablar("La contraseña actual es incorrecta.") return
+        end
+        if #nueva < 3 then hablar("La nueva contraseña debe tener al menos 3 caracteres.") return end
+        cuenta.sal = nuevaSal()
+        cuenta.hash = hashPass(nueva, cuenta.sal)
+        cuenta.pass = nil
+        guardarUsuarios(db)
+        hablar("Contraseña cambiada con éxito.")
+        mostrarAjustes()
+      end },
+    { Button, text = "Volver", layout_width = "fill", onClick = function() mostrarAjustes() end },
+  }
+  cerrar()
+  local d = LuaDialog(ctx)
+  d.setTitle("Cambiar contraseña")
+  d.setView(loadlayout({ ScrollView, layout_width = "fill", cont }, ids))
+  d.show()
+  dlg_activo = d
+end
+
+function mostrarAjustes(msg)
+  local vols = { 0.15, 0.35, 0.55, 0.8 }
+  local function siguienteVol()
+    local actual = volumen()
+    for i, v in ipairs(vols) do
+      if math.abs(v - actual) < 0.01 then return vols[i % #vols + 1] end
+    end
+    return vols[1]
+  end
+  mostrarLayout("Ajustes", (msg and (msg .. "\n\n") or "") ..
+    "Música: " .. (config.musica and "activada" or "desactivada") ..
+    "\nVolumen de música: " .. ent(volumen() * 100) .. "%" ..
+    "\nNarración detallada del combate: " .. (config.narracion ~= false and "activada" or "desactivada"), {
+    { "Música: " .. (config.musica and "desactivar" or "activar"), function()
+        config.musica = not config.musica
+        guardarConfig()
+        if config.musica then cambiarMusica("lobby_music") else detenerMusica() end
+        mostrarAjustes("Música " .. (config.musica and "activada." or "desactivada."))
+      end },
+    { "Cambiar volumen de la música", function()
+        config.volumen = siguienteVol()
+        guardarConfig()
+        if mp_bgm then pcall(function() mp_bgm.setVolume(config.volumen, config.volumen) end) end
+        mostrarAjustes("Volumen al " .. ent(config.volumen * 100) .. "%.")
+      end },
+    { "Narración detallada: " .. (config.narracion ~= false and "desactivar" or "activar"), function()
+        config.narracion = not (config.narracion ~= false)
+        guardarConfig()
+        mostrarAjustes("Narración " .. (config.narracion and "activada." or "desactivada."))
+      end },
+    { "Cambiar contraseña", cambiarPassword },
+    { "Novedades de la versión 3.0", function() mostrarNovedades(mostrarAjustes) end },
+    { "Volver", mostrarMenu },
+  })
+  hablar(msg or "Ajustes.")
+end
+
+function mostrarNovedades(volver)
+  mostrarLayout("Novedades de la versión 3.0", table.concat({
+    "🌐 ¡JUEGO EN LÍNEA! Guarda tu partida en la nube, compite en el ranking mundial, reta a otros jugadores a duelos y habla en el chat del pueblo. El servidor tiene 13 respaldos.",
+    "🗺 100 niveles en 10 regiones, con un jefe cada 5 niveles y 4 enemigos nuevos.",
+    "🔫 6 armas nuevas hasta el Arma del Rey Fantasma, y chaleco hasta nivel 10.",
+    "🏰 Torre de los Jefes: sube pisos infinitos enfrentando un jefe en cada uno.",
+    "🎯 Cartel de Se Busca: una cacería diaria con gran recompensa.",
+    "🍺 Cantina: dados con apuestas y ruleta de la suerte diaria.",
+    "⛏ Mina de oro: produce diamantes mientras no juegas.",
+    "🏆 Más de 50 logros.",
+    "⚖ Equilibrio: el botiquín ahora cura el 35% de tu vida y más rango da más vida.",
+  }, "\n\n"), { { "Volver", function() (volver or pantallaInicio)() end } })
+  hablar("Novedades de la versión 3.0. Lee la lista en pantalla.")
+end
+
+-- ============================================================
+--  PANTALLAS DE INICIO Y REGISTRO
+-- ============================================================
+function pantallaInicio()
+  detenerMusica()
+  combate, viaje, horda = nil, nil, nil
+  session.usuario, session.nombre, session.partida = nil, nil, nil
+  mostrarLayout("Vaquero del Bosque 3.0", "La Gran Actualización.", {
+    { "Iniciar sesión", pantallaLogin },
+    { "Crear cuenta",   pantallaRegistro },
+    { "Novedades de la versión 3.0", function() mostrarNovedades(pantallaInicio) end },
+    { "Salir", function() hablar("Hasta luego.") salirDelJuego() end },
+  })
+  hablar("Vaquero del Bosque versión 3. Inicia sesión o crea una cuenta.")
+end
+
+function pantallaLogin()
+  local ids = {}
+  local cont = {
+    LinearLayout, orientation = "vertical", layout_width = "fill", padding = "14dp",
+    { TextView, text = "Usuario:", layout_width = "fill" },
+    { EditText, id = "u_login", hint = "Tu usuario", layout_width = "fill", layout_marginBottom = "10dp" },
+    { TextView, text = "Contraseña:", layout_width = "fill" },
+    { EditText, id = "p_login", hint = "Contraseña", inputType = 0x81, layout_width = "fill", layout_marginBottom = "15dp" },
+    { Button, text = "Entrar", layout_width = "fill", layout_marginBottom = "6dp", onClick = function()
+        local u = trim(tostring(ids.u_login.getText())):lower():gsub("%s", "")
+        local pw = trim(tostring(ids.p_login.getText()))
+        if u == "" or pw == "" then hablar("Escribe usuario y contraseña.") return end
+        local db = cargarUsuarios()
+        local cuenta = db[u]
+        if not cuenta or (cuenta.hash ~= hashPass(pw, cuenta.sal) and cuenta.pass ~= pw) then
+          hablar("Usuario o contraseña incorrectos.") return
+        end
+        cuenta.partida = normalizarPartida(cuenta.partida or partidaNueva())
+        session.usuario = u session.nombre = cuenta.nombre session.partida = cuenta.partida
+        recordarSesion(u)
+        hablar("Bienvenido de nuevo, " .. session.nombre)
+        mostrarMenu()
+      end },
+    { Button, text = "Volver", layout_width = "fill", onClick = pantallaInicio }
+  }
+  cerrar()
+  local d = LuaDialog(ctx)
+  d.setTitle("Iniciar sesión")
+  d.setView(loadlayout({ ScrollView, layout_width = "fill", cont }, ids))
+  d.show()
+  dlg_activo = d
+end
+
+function pantallaRegistro()
+  local ids = {}
+  local cont = {
+    LinearLayout, orientation = "vertical", layout_width = "fill", padding = "14dp",
+    { TextView, text = "Nombre en juego:", layout_width = "fill" },
+    { EditText, id = "r_nombre", hint = "Ej: Wyatt Earp", layout_width = "fill", layout_marginBottom = "10dp" },
+    { TextView, text = "Usuario:", layout_width = "fill" },
+    { EditText, id = "r_user", hint = "Sin espacios", layout_width = "fill", layout_marginBottom = "10dp" },
+    { TextView, text = "Contraseña:", layout_width = "fill" },
+    { EditText, id = "r_pass", hint = "Mínimo 3 caracteres", inputType = 0x81, layout_width = "fill", layout_marginBottom = "15dp" },
+    { Button, text = "Registrarse", layout_width = "fill", layout_marginBottom = "6dp", onClick = function()
+        local nombre = trim(tostring(ids.r_nombre.getText()))
+        local u = trim(tostring(ids.r_user.getText())):lower():gsub("%s", "")
+        local pw = trim(tostring(ids.r_pass.getText()))
+        if nombre == "" then hablar("Escribe tu nombre en juego.") return end
+        if u == "" then hablar("Escribe tu nombre de usuario.") return end
+        if #pw < 3 then hablar("La contraseña debe tener al menos 3 caracteres.") return end
+        local db = cargarUsuarios()
+        if db[u] then hablar("El usuario ya existe. Elige otro.") return end
+        local sal = nuevaSal()
+        db[u] = { sal = sal, hash = hashPass(pw, sal), nombre = nombre, partida = partidaNueva() }
+        guardarUsuarios(db)
+        session.usuario = u
+        session.nombre = nombre
+        session.partida = normalizarPartida(db[u].partida)
+        recordarSesion(u)
+        hablar("¡Cuenta creada con éxito! Bienvenido, " .. nombre)
+        mostrarMenu()
+      end },
+    { Button, text = "Volver", layout_width = "fill", onClick = pantallaInicio }
+  }
+  cerrar()
+  local d = LuaDialog(ctx)
+  d.setTitle("Crear Cuenta")
+  d.setView(loadlayout({ ScrollView, layout_width = "fill", cont }, ids))
+  d.show()
+  dlg_activo = d
+end
+
+-- ============================================================
+--  MENÚ PRINCIPAL
+-- ============================================================
+function mostrarMenu()
+  combate, viaje, horda = nil, nil, nil
+  local pt = p()
+  guardarPartida()
+  cambiarMusica("lobby_music")
+  if ON.token ~= "" and os.time() - (ON.ultimo or 0) > 180 then ON.autosync() end
+  local hoy = os.date("%Y%m%d")
+  local bots = {}
+  if pt.ultima_recompensa ~= hoy then
+    table.insert(bots, { "🎁 Recompensa diaria disponible", recompensaDiaria })
+  end
+  local etiqueta_hab = "🎯 Habilidades" .. (pt.puntos_hab > 0 and (" (" .. pt.puntos_hab .. " punto(s) sin gastar)") or "")
+  for _, b in ipairs({
+    { "⚔ Modos de juego", function() MD.modos() end },
+    { "🏘 El Pueblo (tiendas, banco, cantina, mina)", function() MD.pueblo() end },
+    { "🌐 Juego en línea: ranking, duelos y chat", function() ON.menu() end },
+    { etiqueta_hab, mostrarHabilidades },
+    { "🏆 Logros", mostrarLogros },
+    { "🏅 Salón de la Fama (este teléfono)", mostrarFama },
+    { "📊 Mi personaje y estadísticas", mostrarEstadisticas },
+    { "⚙ Ajustes", mostrarAjustes },
+    { "🚪 Cerrar sesión", function() config.recordar = nil guardarConfig() guardarPartida() pantallaInicio() end },
+  }) do table.insert(bots, b) end
+
+  local aviso = ""
+  if pt.puntos_hab > 0 then aviso = "\n\nTienes " .. pt.puntos_hab .. " punto(s) de habilidad para gastar." end
+  mostrarLayout("Menú Principal", hud() .. aviso, bots)
+  hablar("Menú principal. Rango " .. pt.rango .. ". Vida " .. pt.vida .. " de " .. pt.vida_max .. ". " .. pt.diamantes .. " diamantes." .. (pt.ultima_recompensa ~= hoy and " Tienes una recompensa diaria disponible." or ""))
+end
+
+-- ============================================================
+--  MODOS EXTRA: MENÚS, TORRE, CACERÍA, CANTINA Y MINA
+-- ============================================================
+MD.BUSCADOS = { "Dedos de Plata", "El Zorro Rojo", "Cuervo Tuerto", "Lobo Solitario", "Víbora Negra", "Mala Racha",
+  "El Fantasma de Texas", "Garra de Oso", "Pólvora Pete", "El Predicador Loco", "Siete Vidas", "La Zarina" }
+
+function MD.modos()
+  local pt = p()
+  mostrarLayout("Modos de juego", hud(), {
+    { "🗺 Campaña: 100 niveles (disponibles hasta el " .. pt.nivel_actual .. ")", seleccionarNivel },
+    { "💀 Supervivencia: horda infinita", menuModoHorda },
+    { "🏰 Torre de los Jefes: pisos infinitos", function() MD.torreIniciar() end },
+    { "🎯 Cartel de Se Busca: cacería diaria", function() MD.caceria() end },
+    { "⚔ Duelos contra otros jugadores (en línea)", function() ON.duelos() end },
+    { "Volver", mostrarMenu },
+  })
+  hablar("Modos de juego.")
+end
+
+function MD.pueblo()
+  local pt = p()
+  mostrarLayout("El Pueblo", hud(), {
+    { "🔥 Armería y Herrería", mostrarArmeria },
+    { "🛒 Almacén General", mostrarAlmacen },
+    { "🐎 Establo", mostrarEstablo },
+    { "🏡 Mi Cabaña", mostrarCasa },
+    { "🏦 Banco", mostrarBanco },
+    { "🍺 Cantina", function() MD.cantina() end },
+    { "⛏ Mina de oro", function() MD.mina() end },
+    { "Volver", mostrarMenu },
+  })
+  hablar("El pueblo.")
+end
+
+function MD.region(r)
+  local pt = p()
+  local desde = (r - 1) * 10 + 1
+  local bots = {}
+  for i = desde, desde + 9 do
+    local bloqueado = i > pt.nivel_actual
+    local j = jefeDe(i)
+    local texto = "Nivel " .. i .. ": " .. zonaDe(i)[1] .. (j and (" (JEFE: " .. j .. ")") or "")
+    texto = texto .. (bloqueado and " - Bloqueado" or (i < pt.nivel_actual and " - Superado" or " - Disponible"))
+    table.insert(bots, { texto, function()
+        if bloqueado then hablar("Nivel bloqueado. Supera los anteriores.") return end
+        iniciarNivel(i)
+      end })
+  end
+  table.insert(bots, { "Volver a las regiones", seleccionarNivel })
+  mostrarLayout("Región " .. r .. ": " .. REGIONES[r][1], REGIONES[r][2] .. "\n\n" .. hud(), bots)
+  hablar("Región " .. r .. ", " .. REGIONES[r][1] .. ".")
+end
+
+-- ---------- Torre de los Jefes ----------
+function MD.torreIniciar()
+  cambiarMusica("jefe_music")
+  local pt = p()
+  mostrarLayout("Torre de los Jefes", "Sube piso a piso: en cada piso te espera un jefe más fuerte.\nTras cada piso recuperas 25% de vida y sumas botín. Si te retiras conservas todo; si mueres, solo el 40%.\n\nTu mejor piso: " .. pt.stats.torre_max .. "\n\n" .. hud(), {
+    { "Comenzar la torre", function()
+        horda = { modo = "torre", oleada = 0, botin_d = 0, botin_xp = 0, superadas = 0 }
+        siguienteOleada()
+      end },
+    { "Volver", function() MD.modos() end },
+  })
+  hablar("Torre de los jefes. Tu mejor piso es " .. pt.stats.torre_max .. ".")
+end
+
+function MD.pisoTorre(h, n)
+  local nombre = JEFES_LISTA[(n - 1) % #JEFES_LISTA + 1]
+  local hp = 100 + n * 45
+  local atk = 12 + n * 3.0
+  iniciarCombate({
+    tipo = "torre", titulo = "Torre de los Jefes - Piso " .. n,
+    enemigos = { crearJefe(nombre .. " (piso " .. n .. ")", hp, atk) }, jefe = true,
+    intro = "Piso " .. n .. ": te espera " .. nombre .. ".",
+    alVencer = hordaVencida,
+    alHuir = function() retirarHorda() end,
+  })
+end
+
+-- ---------- Cacería diaria ----------
+function MD.caceria()
+  local pt = p()
+  local hoy = os.date("%Y%m%d")
+  local nombre = MD.BUSCADOS[(tonumber(hoy) % #MD.BUSCADOS) + 1]
+  local nref = math.max(5, math.min(MAX_NIVELES, pt.nivel_actual))
+  local premio, xp = 40 + nref * 3, 60 + nref * 4
+  if pt.cazado == hoy then
+    mostrarLayout("Cartel de Se Busca", "Ya cobraste la recompensa de hoy por " .. nombre .. ". Mañana habrá un nuevo cartel.", { { "Volver", function() MD.modos() end } })
+    hablar("Ya cobraste la recompensa de hoy.")
+    return
+  end
+  local hp, atk = escala(nref)
+  mostrarLayout("Se busca: " .. nombre, "Recompensa: " .. premio .. " diamantes y " .. xp .. " XP.\nEs un enemigo muy duro (como un jefe del nivel " .. nref .. "). Solo se cobra una vez al día; si pierdes puedes reintentar.\n\n" .. hud(), {
+    { "Ir a cazarlo", function()
+        iniciarCombate({
+          tipo = "caceria", titulo = "Cacería: " .. nombre,
+          enemigos = { crearJefe(nombre, hp * 3.5, atk * 1.15) }, jefe = true,
+          intro = "¡Encuentras a " .. nombre .. "!",
+          alVencer = function(txt) MD.caceriaVencida(txt, nombre, premio, xp) end,
+          alHuir = function() mostrarMenu() end,
+        })
+      end },
+    { "Volver", function() MD.modos() end },
+  })
+  hablar("Se busca " .. nombre .. ". Recompensa " .. premio .. " diamantes.")
+end
+
+function MD.caceriaVencida(txt, nombre, premio, xp)
+  local pt = p()
+  pt.cazado = os.date("%Y%m%d")
+  pt.stats.cazas = pt.stats.cazas + 1
+  local d = ganarDiamantes(pt, premio)
+  txt = txt .. "\n💎 +" .. d .. " diamantes, ✨ +" .. xp .. " XP." .. dar_xp(pt, xp) .. revisarLogros(pt)
+  guardarPartida()
+  cambiarMusica("lobby_music")
+  mostrarLayout("¡Cobraste la recompensa!", "Capturaste a " .. nombre .. ".\n" .. txt .. "\n\n" .. hud(), { { "Volver", function() MD.modos() end } })
+  hablar("Capturaste a " .. nombre .. ". Cobras " .. d .. " diamantes.")
+end
+
+-- ---------- Cantina ----------
+function MD.cantina(msg)
+  local pt = p()
+  local function dados(apuesta)
+    return function()
+      if pt.diamantes < apuesta then hablar("No tienes suficientes diamantes.") return end
+      local yo = math.random(1, 6) + math.random(1, 6)
+      local casa = math.random(1, 6) + math.random(1, 6)
+      local txt = "Sacas " .. yo .. " y el cantinero saca " .. casa .. ". "
+      if yo > casa then
+        sumarDiamantes(pt, apuesta)
+        pt.stats.apuestas_ganadas = pt.stats.apuestas_ganadas + 1
+        txt = txt .. "¡Ganas " .. apuesta .. " diamantes!"
+        reproducirEfecto("snd_moneda")
+      elseif yo == casa then
+        txt = txt .. "Empate: la casa se queda con la apuesta."
+        pt.diamantes = pt.diamantes - apuesta
+      else
+        pt.diamantes = pt.diamantes - apuesta
+        txt = txt .. "Pierdes " .. apuesta .. " diamantes."
+      end
+      local lg = revisarLogros(pt)
+      guardarPartida()
+      MD.cantina(txt .. lg)
+    end
+  end
+  mostrarLayout("Cantina", (msg and (msg .. "\n\n") or "") .. "Dados contra el cantinero: sacas más que él y ganas lo apostado. Si empatan, gana la casa.\nDiamantes: " .. pt.diamantes, {
+    { "Apostar 10 diamantes a los dados", dados(10) },
+    { "Apostar 50 diamantes a los dados", dados(50) },
+    { "Apostar 100 diamantes a los dados", dados(100) },
+    { "Apostar 500 diamantes a los dados", dados(500) },
+    { "Ruleta de la suerte (gratis, una vez al día)", function()
+        local hoy = os.date("%Y%m%d")
+        if pt.ruleta == hoy then hablar("Ya giraste hoy. Vuelve mañana.") return end
+        pt.ruleta = hoy
+        local r, txt = math.random(100), nil
+        if r <= 55 then
+          local d = ganarDiamantes(pt, math.random(5, 30) + pt.rango)
+          txt = "La ruleta te da " .. d .. " diamantes."
+        elseif r <= 70 then
+          pt.botiquines = math.min(10, pt.botiquines + 1)
+          txt = "¡La ruleta te da un botiquín!"
+        elseif r <= 82 then
+          pt.dinamitas = math.min(10, pt.dinamitas + 1)
+          txt = "¡La ruleta te da una dinamita!"
+        elseif r <= 94 then
+          pt.whisky = math.min(10, pt.whisky + 1)
+          txt = "¡La ruleta te da una botella de whisky!"
+        else
+          local d = ganarDiamantes(pt, 150)
+          txt = "¡JACKPOT! Ganas " .. d .. " diamantes."
+          reproducirEfecto("snd_logro", true)
+        end
+        local lg = revisarLogros(pt)
+        guardarPartida()
+        MD.cantina(txt .. lg)
+      end },
+    { "Volver al pueblo", function() MD.pueblo() end },
+  })
+  hablar(msg or "Cantina. Tienes " .. pt.diamantes .. " diamantes.")
+end
+
+-- ---------- Mina de oro ----------
+function MD.mina(msg)
+  local pt = p()
+  local m = pt.mina
+  local function pendiente()
+    if m.nivel <= 0 or m.t == 0 then return 0 end
+    return math.floor(math.min(12, (os.time() - m.t) / 3600) * m.nivel * 3)
+  end
+  local bots = {}
+  if m.nivel <= 0 then
+    table.insert(bots, { "Comprar la mina - 200 diamantes", function()
+        if pt.diamantes < 200 then hablar("Diamantes insuficientes.") return end
+        pt.diamantes = pt.diamantes - 200
+        m.nivel = 1
+        m.t = os.time()
+        local lg = revisarLogros(pt)
+        guardarPartida()
+        MD.mina("¡Compraste la mina! Producirá diamantes aunque no estés jugando." .. lg)
+      end })
+  else
+    table.insert(bots, { "Recoger " .. pendiente() .. " diamantes", function()
+        local ahora = pendiente()
+        if ahora <= 0 then hablar("Todavía no hay nada que recoger.") return end
+        sumarDiamantes(pt, ahora)
+        m.t = os.time()
+        reproducirEfecto("snd_moneda")
+        guardarPartida()
+        MD.mina("Recogiste " .. ahora .. " diamantes.")
+      end })
+    if m.nivel < 25 then
+      local costo = ent(50 * (m.nivel + 1) ^ 1.7)
+      table.insert(bots, { "Mejorar la mina al nivel " .. (m.nivel + 1) .. " - " .. costo .. " diamantes", function()
+          if pt.diamantes < costo then hablar("Diamantes insuficientes.") return end
+          local ahora = pendiente()
+          if ahora > 0 then sumarDiamantes(pt, ahora) end
+          pt.diamantes = pt.diamantes - costo
+          m.nivel = m.nivel + 1
+          m.t = os.time()
+          local lg = revisarLogros(pt)
+          guardarPartida()
+          reproducirEfecto("snd_nivel", true)
+          MD.mina("Mina mejorada al nivel " .. m.nivel .. "." .. lg)
+        end })
+    end
+  end
+  table.insert(bots, { "Volver al pueblo", function() MD.pueblo() end })
+  mostrarLayout("Mina de Oro", (msg and (msg .. "\n\n") or "") .. "Nivel de la mina: " .. m.nivel .. " de 25.\nProduce " .. (m.nivel * 3) .. " diamantes por hora y guarda hasta 12 horas.\nDiamantes: " .. pt.diamantes, bots)
+  hablar(msg or ("Mina de oro, nivel " .. m.nivel .. "."))
+end
+
+-- ============================================================
+--  JUEGO EN LÍNEA (servidor en Vercel + Supabase, 13 respaldos)
+-- ============================================================
+local handler = Handler(Looper.getMainLooper())
+ON.SERVERS = {
+  "https://vaquero-bosque-servidor-accesible.vercel.app",
+  "https://vaquero-bosque-r01-accesible.vercel.app",
+  "https://vaquero-bosque-r02-accesible.vercel.app",
+  "https://vaquero-bosque-r03-accesible.vercel.app",
+  "https://vaquero-bosque-r04-accesible.vercel.app",
+  "https://vaquero-bosque-r05-accesible.vercel.app",
+  "https://vaquero-bosque-r06-accesible.vercel.app",
+  "https://vaquero-bosque-r07-accesible.vercel.app",
+  "https://vaquero-bosque-r08-accesible.vercel.app",
+  "https://vaquero-bosque-r09-accesible.vercel.app",
+  "https://vaquero-bosque-r10-accesible.vercel.app",
+  "https://vaquero-bosque-r11-accesible.vercel.app",
+  "https://vaquero-bosque-r12-accesible.vercel.app",
+  "https://vaquero-bosque-r13-accesible.vercel.app",
+}
+ON.srv = config.srv or 1
+if ON.srv < 1 or ON.srv > #ON.SERVERS then ON.srv = 1 end
+ON.token = config.on_token or ""
+ON.nombre = config.on_name or ""
+ON.ultimo = 0
+
+function ON.req(metodo, ruta, datos, cb)
+  Thread(Runnable{ run = function()
+    local code, texto, ok = 0, "", false
+    for intento = 0, #ON.SERVERS - 1 do
+      local idx = ((ON.srv - 1 + intento) % #ON.SERVERS) + 1
+      code, texto = 0, ""
+      ok = pcall(function()
+        local c = URL(ON.SERVERS[idx] .. ruta).openConnection()
+        c.setRequestMethod(metodo)
+        c.setConnectTimeout(4000)
+        c.setReadTimeout(12000)
+        c.setRequestProperty("Content-Type", "application/json")
+        if ON.token ~= "" then c.setRequestProperty("Authorization", "Bearer " .. ON.token) end
+        if datos then
+          c.setDoOutput(true)
+          local w = OutputStreamWriter(c.getOutputStream(), "UTF-8")
+          w.write(cjson.encode(datos))
+          w.flush()
+          w.close()
+        end
+        code = c.getResponseCode()
+        local stream = (code >= 400) and c.getErrorStream() or c.getInputStream()
+        local br = BufferedReader(InputStreamReader(stream, "UTF-8"))
+        local partes = {}
+        local linea = br.readLine()
+        while linea do partes[#partes + 1] = linea; linea = br.readLine() end
+        br.close()
+        texto = table.concat(partes, "\n")
+      end)
+      if ok and code < 500 then ON.srv = idx; config.srv = idx; break end
+    end
+    handler.post(Runnable{ run = function()
+      if not ok then cb(0, nil, "No se pudo conectar con ningún servidor. Revisa tu internet.") return end
+      local pok, obj = pcall(cjson.decode, texto)
+      if not pok or type(obj) ~= "table" then cb(code, nil, "Respuesta no válida del servidor (código " .. code .. ").") return end
+      cb(code, obj, nil)
+    end })
+  end }).start()
+end
+
+function ON.msgError(code, o, err)
+  if err then return err end
+  if code == 401 then
+    ON.token = ""
+    config.on_token = nil
+    guardarConfig()
+    return "Tu sesión en línea terminó (quizá entraste desde otro teléfono). Entra de nuevo."
+  end
+  return (o and o.error) or "Error desconocido."
+end
+
+function ON.pedir(titulo, hints, ultimoEsClave, onOk, volver)
+  local ids = {}
+  local cont = { LinearLayout, orientation = "vertical", layout_width = "fill", padding = "14dp" }
+  for i, h in ipairs(hints) do
+    local campo = { EditText, id = "c" .. i, hint = h, layout_width = "fill", layout_marginBottom = "10dp" }
+    if ultimoEsClave and i == #hints then campo.inputType = 0x81 end
+    table.insert(cont, campo)
+  end
+  table.insert(cont, { Button, text = "Aceptar", layout_width = "fill", layout_marginBottom = "6dp", onClick = function()
+      local v = {}
+      for i = 1, #hints do v[i] = trim(tostring(ids["c" .. i].getText())) end
+      onOk(v)
+    end })
+  table.insert(cont, { Button, text = "Cancelar", layout_width = "fill", onClick = function() volver() end })
+  cerrar()
+  local d = LuaDialog(ctx)
+  d.setTitle(titulo)
+  d.setView(loadlayout({ ScrollView, layout_width = "fill", cont }, ids))
+  d.show()
+  dlg_activo = d
+end
+
+-- Sube la partida (cb(ok, mensaje))
+function ON.subir(cb)
+  ON.req("POST", "/api/save", { partida = p() }, function(code, o, err)
+    if err or not o.ok then cb(false, ON.msgError(code, o, err)) return end
+    ON.ultimo = os.time()
+    cb(true, "Partida guardada en la nube.")
+  end)
+end
+
+-- Cobra premios pendientes de duelos (cb(ok, texto, cantidad))
+function ON.reclamar(cb)
+  ON.req("POST", "/api/claim", {}, function(code, o, err)
+    if err or not o.ok then cb(false, ON.msgError(code, o, err), 0) return end
+    local pt = p()
+    local txt, n = "", 0
+    for _, m in ipairs(o.mail or {}) do
+      n = n + 1
+      local d = math.floor(tonumber(m.diamantes) or 0)
+      local xp = math.floor(tonumber(m.xp) or 0)
+      local t = tostring(m.texto or "")
+      if d > 0 then sumarDiamantes(pt, d) end
+      txt = txt .. "\n• " .. t
+      if d > 0 or xp > 0 then txt = txt .. " (+" .. d .. " diamantes, +" .. xp .. " XP)" end
+      if xp > 0 then txt = txt .. dar_xp(pt, xp) end
+      if string.find(t, "ganaste", 1, true) then pt.stats.duelos_ganados = pt.stats.duelos_ganados + 1 end
+    end
+    if n > 0 then txt = txt .. revisarLogros(pt) guardarPartida() end
+    cb(true, n > 0 and ("Novedades de tus duelos:" .. txt) or "No tienes novedades.", n)
+  end)
+end
+
+function ON.autosync()
+  ON.ultimo = os.time()
+  ON.subir(function(ok)
+    if ok then
+      ON.reclamar(function(ok2, txt, n) if n and n > 0 then hablar(txt) end end)
+    end
+  end)
+end
+
+function ON.menu(msg)
+  local conectado = ON.token ~= ""
+  local bots = {}
+  if not conectado then
+    table.insert(bots, { "Entrar a mi cuenta en línea", function() ON.entrar(false) end })
+    table.insert(bots, { "Crear cuenta en línea", function() ON.entrar(true) end })
+  else
+    table.insert(bots, { "⚔ Duelos contra otros jugadores", function() ON.duelos() end })
+    table.insert(bots, { "🏅 Ranking mundial", function() ON.ranking("score") end })
+    table.insert(bots, { "💬 Chat del pueblo", function() ON.chat() end })
+    table.insert(bots, { "🔎 Buscar jugadores", function() ON.buscarPedir() end })
+    table.insert(bots, { "☁ Subir mi partida a la nube ahora", function()
+        ON.subir(function(ok, m) ON.menu(m) end)
+      end })
+    table.insert(bots, { "⬇ Descargar mi partida de la nube", function() ON.bajarConfirmar() end })
+    table.insert(bots, { "Cerrar sesión en línea", function()
+        ON.token = ""
+        config.on_token = nil
+        config.on_name = nil
+        guardarConfig()
+        ON.nombre = ""
+        ON.menu("Sesión en línea cerrada. Tu partida local sigue en este teléfono.")
+      end })
+  end
+  table.insert(bots, { "Probar los servidores", function() ON.probar() end })
+  table.insert(bots, { "Volver", mostrarMenu })
+  local estado = conectado and ("Conectado como " .. ON.nombre .. ". Tu partida se guarda sola en la nube cada pocos minutos.")
+    or "Crea una cuenta en línea para guardar tu partida en la nube, aparecer en el ranking mundial, retar a otros jugadores y hablar en el chat."
+  mostrarLayout("Juego en línea", (msg and (msg .. "\n\n") or "") .. estado, bots)
+  hablar(msg or "Juego en línea.")
+end
+
+function ON.entrar(registro)
+  ON.pedir(registro and "Crear cuenta en línea" or "Entrar a mi cuenta en línea",
+    { "Nombre de usuario (3 a 20 letras)", "Contraseña (mínimo 4)" }, true, function(v)
+      if v[1] == "" or v[2] == "" then hablar("Escribe usuario y contraseña.") ON.entrar(registro) return end
+      ON.token = ""
+      ON.req("POST", registro and "/api/register" or "/api/login", { name = v[1], password = v[2] }, function(code, o, err)
+        if err or not o.ok then ON.menu(ON.msgError(code, o, err)) return end
+        ON.token = o.token
+        ON.nombre = o.name
+        config.on_token = o.token
+        config.on_name = o.name
+        guardarConfig()
+        ON.sincronizarInicial()
+      end)
+    end, function() ON.menu() end)
+end
+
+function ON.sincronizarInicial()
+  ON.req("GET", "/api/state", nil, function(code, o, err)
+    if err or not o.ok then ON.menu(ON.msgError(code, o, err)) return end
+    if type(o.partida) ~= "table" then
+      ON.subir(function(ok, m) ON.menu("Cuenta lista. " .. m) end)
+      return
+    end
+    local nube, pt = o.partida, p()
+    mostrarLayout("Partida en la nube", "Tu cuenta en línea ya tiene una partida: rango " .. tostring(nube.rango or 1) .. ", nivel " .. tostring(nube.nivel_actual or 1) .. ".\nTu partida en este teléfono: rango " .. pt.rango .. ", nivel " .. pt.nivel_actual .. ".\n¿Cuál quieres usar?", {
+      { "Usar la de la nube (reemplaza la de este teléfono)", function()
+          session.partida = normalizarPartida(nube)
+          guardarPartida()
+          ON.menu("Partida de la nube descargada.")
+        end },
+      { "Usar la de este teléfono (reemplaza la de la nube)", function()
+          ON.subir(function(ok, m) ON.menu(m) end)
+        end },
+    })
+  end)
+end
+
+function ON.bajarConfirmar()
+  mostrarLayout("Descargar partida", "Se reemplazará la partida de este teléfono por la que está guardada en la nube. ¿Continuar?", {
+    { "Sí, descargar", function()
+        ON.req("GET", "/api/state", nil, function(code, o, err)
+          if err or not o.ok then ON.menu(ON.msgError(code, o, err)) return end
+          if type(o.partida) ~= "table" then ON.menu("Todavía no hay partida en la nube.") return end
+          session.partida = normalizarPartida(o.partida)
+          guardarPartida()
+          ON.menu("Partida descargada.")
+        end)
+      end },
+    { "No, volver", function() ON.menu() end },
+  })
+end
+
+-- ---------- ranking, jugadores y perfiles ----------
+function ON.ranking(tipo)
+  ON.req("GET", "/api/ranking?kind=" .. tipo, nil, function(code, o, err)
+    if err or not o.ok then ON.menu(ON.msgError(code, o, err)) return end
+    local bots = {}
+    for i, e in ipairs(o.ranking or {}) do
+      table.insert(bots, { i .. ". " .. e.name .. ": rango " .. e.rango .. ", nivel " .. e.nivel .. ", oleada " .. e.oleada .. ", " .. e.score .. " puntos", function() ON.perfil(e.name) end })
+    end
+    if #bots == 0 then table.insert(bots, { "Todavía no hay jugadores en el ranking.", function() end }) end
+    table.insert(bots, { tipo == "score" and "Ordenar por mejor oleada" or "Ordenar por puntos", function() ON.ranking(tipo == "score" and "oleada" or "score") end })
+    table.insert(bots, { "Volver", function() ON.menu() end })
+    mostrarLayout("Ranking mundial", "Toca un jugador para ver su perfil y retarlo a un duelo.", bots)
+    hablar("Ranking mundial. " .. #(o.ranking or {}) .. " jugadores.")
+  end)
+end
+
+function ON.buscarPedir()
+  ON.pedir("Buscar jugadores", { "Parte del nombre (vacío = todos)" }, false, function(v) ON.buscar(v[1]) end, function() ON.menu() end)
+end
+
+function ON.buscar(q)
+  ON.req("GET", "/api/find?q=" .. URLEncoder.encode(q or "", "UTF-8"), nil, function(code, o, err)
+    if err or not o.ok then ON.menu(ON.msgError(code, o, err)) return end
+    local bots = {}
+    for _, e in ipairs(o.players or {}) do
+      table.insert(bots, { e.name .. " (rango " .. e.rango .. ")", function() ON.perfil(e.name) end })
+    end
+    if #bots == 0 then table.insert(bots, { "No se encontró a nadie con ese nombre.", function() end }) end
+    table.insert(bots, { "Buscar otra vez", function() ON.buscarPedir() end })
+    table.insert(bots, { "Volver", function() ON.menu() end })
+    mostrarLayout("Jugadores", "Toca un jugador para ver su perfil.", bots)
+  end)
+end
+
+function ON.perfil(nombre)
+  ON.req("GET", "/api/player?name=" .. URLEncoder.encode(nombre, "UTF-8"), nil, function(code, o, err)
+    if err or not o.ok then ON.menu(ON.msgError(code, o, err)) return end
+    local bots = {}
+    if string.lower(o.name) ~= string.lower(ON.nombre) then
+      table.insert(bots, { "⚔ Retar a duelo", function() ON.duelo(o.name) end })
+    end
+    table.insert(bots, { "Volver", function() ON.menu() end })
+    mostrarLayout("Perfil de " .. o.name, "Rango " .. o.rango .. "\nNivel de campaña: " .. o.nivel .. "\nMejor oleada: " .. o.oleada .. "\nEnemigos derrotados: " .. o.kills .. "\nVictorias: " .. o.victorias .. "\nPuntos: " .. o.score, bots)
+    hablar("Perfil de " .. o.name .. ", rango " .. o.rango .. ".")
+  end)
+end
+
+-- ---------- duelos ----------
+function ON.duelos(msg)
+  if ON.token == "" then ON.menu("Primero entra a tu cuenta en línea para jugar duelos.") return end
+  mostrarLayout("Duelos", (msg and (msg .. "\n\n") or "") .. "Reta a otro jugador. El servidor simula el combate con las armas y habilidades de los dos y decide el ganador. Ganas diamantes y XP; hay un límite de 20 duelos pagados al día.", {
+    { "Buscar un rival por nombre", function() ON.buscarPedir() end },
+    { "Elegir un rival del ranking mundial", function() ON.ranking("score") end },
+    { "Reclamar premios pendientes", function()
+        ON.reclamar(function(ok, txt) ON.duelos(txt) end)
+      end },
+    { "Volver", function() MD.modos() end },
+  })
+  hablar(msg or "Duelos en línea.")
+end
+
+function ON.duelo(nombre)
+  hablar("Duelo contra " .. nombre .. ". Preparando.")
+  ON.subir(function(ok, m)
+    if not ok then ON.menu(m) return end
+    ON.req("POST", "/api/duel", { target = nombre }, function(code, o, err)
+      if err or not o.ok then ON.duelos(ON.msgError(code, o, err)) return end
+      local lineas = {}
+      for _, l in ipairs(o.log or {}) do lineas[#lineas + 1] = l end
+      ON.reclamar(function(ok2, txt)
+        reproducirEfecto(o.won and "victoria" or "snd_derrota")
+        mostrarLayout(o.won and "¡Ganaste el duelo!" or "Perdiste el duelo", table.concat(lineas, "\n") .. "\n\n" .. txt .. "\n\n" .. hud(), {
+          { "Revancha", function() ON.duelo(nombre) end },
+          { "Volver", function() ON.duelos() end },
+        })
+        hablar(o.won and ("¡Ganaste el duelo contra " .. nombre .. "!") or ("Perdiste el duelo contra " .. nombre .. "."))
+      end)
+    end)
+  end)
+end
+
+-- ---------- chat del pueblo ----------
+function ON.chat(msg, enviar)
+  ON.req(enviar and "POST" or "GET", "/api/chat?after=0", enviar and { text = enviar } or nil, function(code, o, err)
+    if err or not o.ok then
+      local e = ON.msgError(code, o, err)
+      if enviar and code ~= 401 and code ~= 0 then ON.chat(e) else ON.menu(e) end
+      return
+    end
+    local lineas = {}
+    for _, m in ipairs(o.messages or {}) do
+      lineas[#lineas + 1] = os.date("%H:%M", math.floor((tonumber(m.ts) or 0) / 1000)) .. " " .. tostring(m.name) .. ": " .. tostring(m.text)
+    end
+    mostrarLayout("Chat del pueblo", (msg and (msg .. "\n\n") or "") .. (#lineas > 0 and table.concat(lineas, "\n") or "Aún no hay mensajes. ¡Escribe el primero!"), {
+      { "Escribir un mensaje", function()
+          ON.pedir("Mensaje para el pueblo", { "Escribe tu mensaje (máximo 200 letras)" }, false, function(v)
+            if v[1] == "" then ON.chat() else ON.chat(nil, v[1]) end
+          end, function() ON.chat() end)
+        end },
+      { "Actualizar", function() ON.chat() end },
+      { "Volver", function() ON.menu() end },
+    })
+    hablar(msg or ("Chat del pueblo. " .. #lineas .. " mensajes."))
+  end)
+end
+
+-- ---------- prueba de servidores ----------
+function ON.probar()
+  hablar("Probando los servidores. Puede tardar unos segundos.")
+  Thread(Runnable{ run = function()
+    local res = {}
+    for i, base in ipairs(ON.SERVERS) do
+      local t0 = System.currentTimeMillis()
+      local code = 0
+      local ok = pcall(function()
+        local c = URL(base .. "/api/info").openConnection()
+        c.setConnectTimeout(3000)
+        c.setReadTimeout(5000)
+        code = c.getResponseCode()
+      end)
+      local ms = System.currentTimeMillis() - t0
+      local nombre = (i == 1) and "Principal" or ("Respaldo " .. (i - 1))
+      if ok and code == 200 then res[#res + 1] = nombre .. ": funciona (" .. ms .. " ms)"
+      elseif ok and code == 423 then res[#res + 1] = nombre .. ": cerrado por el administrador"
+      elseif code ~= 0 then res[#res + 1] = nombre .. ": error " .. code
+      else res[#res + 1] = nombre .. ": sin respuesta" end
+    end
+    handler.post(Runnable{ run = function()
+      ON.menu("Servidor en uso: " .. ((ON.srv == 1) and "Principal" or ("Respaldo " .. (ON.srv - 1))) .. "\n" .. table.concat(res, "\n"))
+    end })
+  end }).start()
+end
+
+-- ============================================================
+--  INICIO AUTOMÁTICO
+-- ============================================================
+generarSinteticos()
+
+local function intentarAutoLogin()
+  local u = config.recordar
+  if not u then return false end
+  local db = cargarUsuarios()
+  local cuenta = db[u]
+  if not cuenta then return false end
+  cuenta.partida = normalizarPartida(cuenta.partida or partidaNueva())
+  session.usuario = u session.nombre = cuenta.nombre session.partida = cuenta.partida
+  hablar("Bienvenido de nuevo, " .. session.nombre)
+  mostrarMenu()
+  return true
+end
+
+if not intentarAutoLogin() then pantallaInicio() end
